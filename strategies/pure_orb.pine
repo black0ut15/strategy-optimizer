@@ -1,0 +1,376 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Pure ORB Strategy — Universal, any futures instrument
+// No daily lookbacks. No pattern filters. No trend filter.
+// Just: build the range, break it, manage the trade.
+
+//@version=6
+strategy("Pure ORB [MES 3ct]", overlay=true, margin_long=10, margin_short=10,
+     default_qty_type=strategy.fixed, default_qty_value=3,
+     initial_capital=50000, commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.50, slippage=1, calc_on_every_tick=false,
+     max_bars_back=500, process_orders_on_close=false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ INPUTS ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_mode = "Strategy"
+i_mode = input.string("Both", "Direction", options=["Both", "Long Only", "Short Only"], group=grp_mode)
+i_maxTradesPerDay = input.int(1, "Max Trades Per Day", minval=1, maxval=5, group=grp_mode)
+i_qty = input.int(3, "Contracts", minval=1, maxval=20, group=grp_mode)
+i_confirmClose = input.bool(true, "Require Candle Close Beyond Level", group=grp_mode,
+     tooltip="Wait for bar to CLOSE beyond OR high/low. Reduces false breakouts.")
+
+grp_session = "Session"
+i_orMinutes = input.int(15, "Opening Range (minutes)", minval=1, maxval=120, group=grp_session,
+     tooltip="Duration to build the opening range. Try 5, 15, 30.")
+i_cashSession = input.session("0830-1500", "Trading Session (Exchange TZ)", group=grp_session,
+     tooltip="Session in exchange timezone. CME equity: 0830-1500 CT. COMEX gold: 0820-1400 ET.")
+i_flattenSession = input.session("1455-1500", "Flatten Window (Exchange TZ)", group=grp_session,
+     tooltip="Flatten all positions during this window.")
+i_entrySession = input.session("0830-1100", "Entry Window (Exchange TZ)", group=grp_session,
+     tooltip="Only enter new trades during this window.")
+
+grp_sl = "Stop Loss"
+i_slMode = input.string("Opposite Side", "Stop Loss Placement",
+     options=["Opposite Side", "OR Midpoint", "ATR"], group=grp_sl,
+     tooltip="Opposite Side = SL at other end of OR. OR Mid = middle of range. ATR = ATR multiple.")
+i_slPad = input.float(0.0, "SL Padding (points)", minval=0, maxval=50, step=0.25, group=grp_sl,
+     tooltip="Extra buffer beyond stop level. Set per instrument.")
+i_slAtrMult = input.float(1.5, "SL ATR Mult (if ATR mode)", minval=0.5, maxval=5.0, step=0.1, group=grp_sl)
+
+grp_tp = "Take Profit"
+i_tpMode = input.string("R Multiple", "Take Profit Mode",
+     options=["R Multiple", "OR Multiple", "ATR Multiple", "None"], group=grp_tp)
+i_tpRMult = input.float(2.0, "TP as R:R", minval=0.5, maxval=10.0, step=0.25, group=grp_tp,
+     tooltip="TP as multiple of initial risk distance.")
+i_tpOrMult = input.float(2.0, "TP as OR Range Multiple", minval=0.5, maxval=10.0, step=0.25, group=grp_tp,
+     tooltip="TP as multiple of the opening range size.")
+i_tpAtrMult = input.float(3.0, "TP as ATR Multiple", minval=0.5, maxval=10.0, step=0.5, group=grp_tp)
+
+grp_trail = "Trailing Stop"
+i_useTrail = input.bool(true, "Enable Trailing Stop", group=grp_trail)
+i_trailAtrMult = input.float(1.2, "Trail ATR Mult", minval=0.3, maxval=5.0, step=0.1, group=grp_trail)
+i_trailAfterR = input.float(0.75, "Activate After (R profit)", minval=0.1, maxval=5.0, step=0.25, group=grp_trail)
+
+grp_be = "Breakeven"
+i_useBE = input.bool(true, "Enable Breakeven Stop", group=grp_be)
+i_beAfterR = input.float(0.5, "Move to BE After (R profit)", minval=0.1, maxval=3.0, step=0.1, group=grp_be)
+
+grp_time = "Time Stop"
+i_useTimeStop = input.bool(true, "Enable Time Stop", group=grp_time)
+i_timeStopBars = input.int(12, "Bars Before Time Stop", minval=1, maxval=100, group=grp_time,
+     tooltip="If trade is at or below entry after this many bars, close it.")
+
+grp_atr = "ATR"
+i_atrLen = input.int(14, "ATR Length", minval=5, maxval=50, group=grp_atr)
+
+grp_vis = "Visuals"
+i_showOR = input.bool(true, "Show Opening Range Box", group=grp_vis)
+i_showLevels = input.bool(true, "Show Entry Levels", group=grp_vis)
+i_showTPSL = input.bool(true, "Show TP/SL Lines When In Trade", group=grp_vis)
+i_showTable = input.bool(true, "Show Info Table", group=grp_vis)
+i_orColor = input.color(color.new(color.blue, 80), "OR Box Color", group=grp_vis)
+i_longColor = input.color(color.new(color.teal, 0), "Long Color", group=grp_vis)
+i_shortColor = input.color(color.new(color.red, 0), "Short Color", group=grp_vis)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ SESSION DETECTION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+inSession     = not na(time(timeframe.period, i_cashSession))
+isFlattenTime = not na(time(timeframe.period, i_flattenSession))
+inEntryWindow = not na(time(timeframe.period, i_entrySession))
+
+var bool prevInSession = false
+isSessionFirstBar = inSession and not prevInSession
+prevInSession := inSession
+
+var int prevDOM = -1
+curDOM = dayofmonth(time)
+isNewDay = curDOM != prevDOM
+if isNewDay
+    prevDOM := curDOM
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ OPENING RANGE ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+var float orHigh  = na
+var float orLow   = na
+var float orMid   = na
+var bool  orLocked = false
+var float orRange  = na
+var int   orBarCount = 0
+
+barMins = timeframe.in_seconds() / 60
+
+if isSessionFirstBar
+    orHigh    := high
+    orLow     := low
+    orLocked  := false
+    orRange   := na
+    orMid     := na
+    orBarCount := 1
+else if inSession and not orLocked
+    orBarCount += 1
+    orHigh := math.max(nz(orHigh, high), high)
+    orLow  := math.min(nz(orLow, low), low)
+
+if inSession and not orLocked and orBarCount * barMins >= i_orMinutes
+    orLocked := true
+    orRange  := orHigh - orLow
+    orMid    := (orHigh + orLow) / 2.0
+
+// Entry levels are simply the OR high and low
+longEntry  = orHigh
+shortEntry = orLow
+
+atrVal = ta.atr(i_atrLen)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ STOP LOSS CALCULATION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+f_longSL() =>
+    switch i_slMode
+        "Opposite Side" => orLow - i_slPad
+        "OR Midpoint"   => orMid - i_slPad
+        => longEntry - atrVal * i_slAtrMult
+
+f_shortSL() =>
+    switch i_slMode
+        "Opposite Side" => orHigh + i_slPad
+        "OR Midpoint"   => orMid + i_slPad
+        => shortEntry + atrVal * i_slAtrMult
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ TAKE PROFIT CALCULATION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+f_longTP(float _entry, float _risk) =>
+    float result = na
+    switch i_tpMode
+        "R Multiple"   => result := _entry + _risk * i_tpRMult
+        "OR Multiple"  => result := _entry + nz(orRange, _risk) * i_tpOrMult
+        "ATR Multiple" => result := _entry + atrVal * i_tpAtrMult
+    result
+
+f_shortTP(float _entry, float _risk) =>
+    float result = na
+    switch i_tpMode
+        "R Multiple"   => result := _entry - _risk * i_tpRMult
+        "OR Multiple"  => result := _entry - nz(orRange, _risk) * i_tpOrMult
+        "ATR Multiple" => result := _entry - atrVal * i_tpAtrMult
+    result
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ TRADE EXECUTION ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+var int   entryBar = 0
+var float entryPrice = na
+var float initialSL = na
+var float initialRisk = na
+var float initialTP = na
+var bool  trailActive = false
+var float trailStopPrice = na
+var int   tradesToday = 0
+
+if isNewDay
+    tradesToday := 0
+
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+isFlat  = strategy.position_size == 0
+
+canTrade = orLocked and inSession and inEntryWindow and not isFlattenTime and isFlat and tradesToday < i_maxTradesPerDay
+
+canGoLong  = i_mode == "Both" or i_mode == "Long Only"
+canGoShort = i_mode == "Both" or i_mode == "Short Only"
+
+longTrigger  = i_confirmClose ? close > longEntry : high > longEntry
+shortTrigger = i_confirmClose ? close < shortEntry : low < shortEntry
+
+// --- Long ---
+longCond = canTrade and canGoLong and not na(longEntry) and not na(orLow) and longTrigger
+if longCond
+    _sl = f_longSL()
+    _risk = math.abs(close - _sl)
+    _tp = f_longTP(close, _risk)
+    longEntryMsg = '{"ticker": "' + syminfo.tickerid + '", "action": "buy", "direction": "long", "price": ' + str.tostring(close) + ', "quantity": ' + str.tostring(i_qty) + ', "stop_loss": ' + str.tostring(_sl) + ', "take_profit": ' + str.tostring(nz(_tp, 0)) + ', "strategy": "Pure ORB MES", "signal": "Long Entry"}'
+    longExitMsg = '{"ticker": "' + syminfo.tickerid + '", "action": "sell", "direction": "exit", "price": 0, "quantity": ' + str.tostring(i_qty) + ', "strategy": "Pure ORB MES", "signal": "Long Exit"}'
+    strategy.entry("Long", strategy.long, alert_message=longEntryMsg)
+    if not na(_tp)
+        strategy.exit("Long Exit", "Long", stop=_sl, limit=_tp, alert_message=longExitMsg)
+    else
+        strategy.exit("Long Exit", "Long", stop=_sl, alert_message=longExitMsg)
+    entryBar    := bar_index
+    entryPrice  := close
+    initialSL   := _sl
+    initialRisk := _risk
+    initialTP   := _tp
+    trailActive := false
+    trailStopPrice := na
+    tradesToday += 1
+
+// --- Short ---
+shortCond = canTrade and canGoShort and not na(shortEntry) and not na(orHigh) and shortTrigger
+if shortCond
+    _sl = f_shortSL()
+    _risk = math.abs(_sl - close)
+    _tp = f_shortTP(close, _risk)
+    shortEntryMsg = '{"ticker": "' + syminfo.tickerid + '", "action": "sell", "direction": "short", "price": ' + str.tostring(close) + ', "quantity": ' + str.tostring(i_qty) + ', "stop_loss": ' + str.tostring(_sl) + ', "take_profit": ' + str.tostring(nz(_tp, 0)) + ', "strategy": "Pure ORB MES", "signal": "Short Entry"}'
+    shortExitMsg = '{"ticker": "' + syminfo.tickerid + '", "action": "buy", "direction": "exit", "price": 0, "quantity": ' + str.tostring(i_qty) + ', "strategy": "Pure ORB MES", "signal": "Short Exit"}'
+    strategy.entry("Short", strategy.short, alert_message=shortEntryMsg)
+    if not na(_tp)
+        strategy.exit("Short Exit", "Short", stop=_sl, limit=_tp, alert_message=shortExitMsg)
+    else
+        strategy.exit("Short Exit", "Short", stop=_sl, alert_message=shortExitMsg)
+    entryBar    := bar_index
+    entryPrice  := close
+    initialSL   := _sl
+    initialRisk := _risk
+    initialTP   := _tp
+    trailActive := false
+    trailStopPrice := na
+    tradesToday += 1
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ TRADE MANAGEMENT ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+barsSinceEntry = bar_index - entryBar
+currentR = 0.0
+if isLong and initialRisk > 0
+    currentR := (close - entryPrice) / initialRisk
+if isShort and initialRisk > 0
+    currentR := (entryPrice - close) / initialRisk
+
+// Breakeven
+if i_useBE and not isFlat and initialRisk > 0 and currentR >= i_beAfterR
+    beSL = entryPrice + (isLong ? i_slPad : -i_slPad)
+    beExitMsg = '{"ticker": "' + syminfo.tickerid + '", "action": "exit", "direction": "exit", "price": 0, "quantity": ' + str.tostring(i_qty) + ', "strategy": "Pure ORB MES", "signal": "Breakeven Exit"}'
+    if isLong
+        strategy.exit("Long Exit", "Long", stop=beSL, limit=initialTP, alert_message=beExitMsg)
+    if isShort
+        strategy.exit("Short Exit", "Short", stop=beSL, limit=initialTP, alert_message=beExitMsg)
+
+// Trailing Stop
+if i_useTrail and not isFlat and initialRisk > 0 and currentR >= i_trailAfterR
+    trailActive := true
+
+if trailActive and not isFlat
+    trailOffset = atrVal * i_trailAtrMult
+    trailExitMsg = '{"ticker": "' + syminfo.tickerid + '", "action": "exit", "direction": "exit", "price": 0, "quantity": ' + str.tostring(i_qty) + ', "strategy": "Pure ORB MES", "signal": "Trail Exit"}'
+    if isLong
+        newTrail = close - trailOffset
+        trailStopPrice := na(trailStopPrice) ? newTrail : math.max(nz(trailStopPrice), newTrail)
+        if trailStopPrice > entryPrice
+            strategy.exit("Long Exit", "Long", stop=trailStopPrice, limit=initialTP, alert_message=trailExitMsg)
+    if isShort
+        newTrail = close + trailOffset
+        trailStopPrice := na(trailStopPrice) ? newTrail : math.min(nz(trailStopPrice), newTrail)
+        if trailStopPrice < entryPrice
+            strategy.exit("Short Exit", "Short", stop=trailStopPrice, limit=initialTP, alert_message=trailExitMsg)
+
+// Time Stop
+if i_useTimeStop and not isFlat and barsSinceEntry >= i_timeStopBars
+    timeStopMsg = '{"ticker": "' + syminfo.tickerid + '", "action": "exit", "direction": "exit", "price": 0, "quantity": ' + str.tostring(i_qty) + ', "strategy": "Pure ORB MES", "signal": "Time Stop"}'
+    if isLong and close <= entryPrice
+        strategy.close("Long", comment="Time Stop", alert_message=timeStopMsg)
+    if isShort and close >= entryPrice
+        strategy.close("Short", comment="Time Stop", alert_message=timeStopMsg)
+
+// EOD Flatten
+if isFlattenTime and not isFlat
+    flattenMsg = '{"ticker": "' + syminfo.tickerid + '", "action": "exit", "direction": "exit", "price": 0, "quantity": ' + str.tostring(i_qty) + ', "strategy": "Pure ORB MES", "signal": "EOD Flatten"}'
+    strategy.close_all(comment="EOD Flatten", alert_message=flattenMsg)
+
+// Reset
+if isFlat
+    trailActive := false
+    trailStopPrice := na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ VISUALS ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+var box orBox = na
+if isSessionFirstBar and i_showOR
+    orBox := box.new(bar_index, nz(orHigh, high), bar_index, nz(orLow, low), bgcolor=i_orColor, border_color=color.blue, border_width=1)
+if not orLocked and inSession and not na(orBox) and i_showOR
+    box.set_top(orBox, orHigh)
+    box.set_bottom(orBox, orLow)
+    box.set_right(orBox, bar_index)
+if orLocked and not na(orBox) and i_showOR
+    box.set_right(orBox, bar_index + 20)
+
+showLvl = orLocked and i_showLevels and inSession and not isFlattenTime
+plot(showLvl ? longEntry : na, "Long Entry", i_longColor, 2, plot.style_linebr)
+plot(showLvl ? shortEntry : na, "Short Entry", i_shortColor, 2, plot.style_linebr)
+plot(showLvl and not na(orMid) ? orMid : na, "OR Mid", color.new(color.gray, 50), 1, plot.style_linebr)
+
+// TP / SL / Entry / Trail lines while in a trade
+inTrade = not isFlat and i_showTPSL
+plot(inTrade ? entryPrice : na, "Entry", color.new(color.white, 30), 1, plot.style_linebr)
+plot(inTrade and not na(initialSL) ? initialSL : na, "Stop Loss", color.new(color.red, 20), 2, plot.style_linebr)
+plot(inTrade and not na(initialTP) ? initialTP : na, "Take Profit", color.new(color.green, 20), 2, plot.style_linebr)
+plot(inTrade and trailActive and not na(trailStopPrice) ? trailStopPrice : na, "Trail Stop", color.new(color.orange, 20), 2, plot.style_linebr)
+
+// Time stop countdown label
+if inTrade and i_useTimeStop and i_showTPSL
+    barsLeft = i_timeStopBars - barsSinceEntry
+    if barsLeft > 0 and barsLeft <= 4
+        label.new(bar_index, isLong ? low - atrVal * 0.3 : high + atrVal * 0.3, 
+             str.tostring(barsLeft), style=isLong ? label.style_label_up : label.style_label_down,
+             color=color.new(color.orange, 50), textcolor=color.white, size=size.tiny)
+
+// Background tint while in trade
+bgcolor(not isFlat and i_showTPSL ? (isLong ? color.new(color.teal, 95) : color.new(color.red, 95)) : na)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ INFO TABLE ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table tbl = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+if barstate.islast and i_showTable
+    table.cell(tbl, 0, 0, "Pure ORB", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.teal, 30))
+    table.cell(tbl, 1, 0, syminfo.tickerid, text_color=color.white, text_size=size.normal, bgcolor=color.new(color.teal, 30))
+
+    table.cell(tbl, 0, 1, "Session", text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 1, inSession ? "● OPEN" : "○ CLOSED", text_color=inSession ? color.lime : color.red, text_size=size.small)
+
+    table.cell(tbl, 0, 2, "OR", text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 2, orLocked ? "LOCKED" : "FORMING (" + str.tostring(orBarCount) + ")", text_color=orLocked ? color.lime : color.yellow, text_size=size.small)
+
+    table.cell(tbl, 0, 3, "OR Range", text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 3, orLocked ? str.tostring(nz(orRange, 0), format.mintick) : "—", text_color=color.white, text_size=size.small)
+
+    table.cell(tbl, 0, 4, "Long / Short", text_color=color.gray, text_size=size.small)
+    lS = orLocked and not na(longEntry) ? str.tostring(longEntry, format.mintick) : "—"
+    sS = orLocked and not na(shortEntry) ? str.tostring(shortEntry, format.mintick) : "—"
+    table.cell(tbl, 1, 4, lS + " / " + sS, text_color=color.white, text_size=size.small)
+
+    table.cell(tbl, 0, 5, "Trades Today", text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 5, str.tostring(tradesToday) + "/" + str.tostring(i_maxTradesPerDay), text_color=tradesToday >= i_maxTradesPerDay ? color.orange : color.white, text_size=size.small)
+
+    table.cell(tbl, 0, 6, "Current R", text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 6, not isFlat ? str.tostring(currentR, "#.##") + "R" : "Flat", text_color=currentR > 0 ? color.lime : currentR < 0 ? color.red : color.gray, text_size=size.small)
+
+    table.cell(tbl, 0, 7, "Trail", text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 7, trailActive ? "ACTIVE" : "—", text_color=trailActive ? color.lime : color.gray, text_size=size.small)
+
+    table.cell(tbl, 0, 8, "ATR(" + str.tostring(i_atrLen) + ")", text_color=color.gray, text_size=size.small)
+    table.cell(tbl, 1, 8, str.tostring(nz(atrVal, 0), format.mintick), text_color=color.white, text_size=size.small)
+
+    table.cell(tbl, 0, 9, "Exch TZ", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 9, syminfo.timezone, text_color=color.yellow, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ ALERTS ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Alerts are embedded in strategy orders via alert_message parameter
+// Use {{strategy.order.alert_message}} in TradingView alert message field

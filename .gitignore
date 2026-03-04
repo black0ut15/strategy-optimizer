@@ -1,0 +1,28 @@
+# Environment & secrets
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Rust
+target/
+src-tauri/target/
+
+# Node
+node_modules/
+
+# Data (large, user-specific)
+data/
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

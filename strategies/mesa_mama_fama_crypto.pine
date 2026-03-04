@@ -1,0 +1,778 @@
+//@version=5
+// MESA MAMA FAMA Crypto v3.3 — BTC Optimized
+// ============================================================
+// Optimized for BTCUSDT perpetual on 5-minute chart.
+// Parameters tuned through systematic backtesting with real
+// fee analysis (Bitunix 0.02%/0.05% maker/taker).
+//
+// Key settings (DO NOT CHANGE without re-backtesting):
+//   minHoldBars    = 144  (12h hold — eliminates unprofitable <12h exits)
+//   sepThreshold   = 0.003 (0.3% — filters weak MAMA/FAMA crossovers)
+//   Regime filter  = ON   (200 EMA — suppresses counter-trend entries)
+//   MAMA trail     = 0.15% (tighter profit capture)
+//   BE trigger     = 0.30% (breakeven stop activation)
+//   Profit lock    = ON   (48 bars/0.15% peak/50% retrace)
+//
+// Backtest results (BTC, 365 days, $1K account):
+//   PF 1.60 | WR 55.9% | Net $44,471 after 0.07% RT fees
+//   DD -$15,256 | 11/13 months profitable | 598 trades
+//
+// Progression:
+//   v3.1.1 baseline (h=36):  PF 1.08, fee-negative
+//   v3.3 h=60:               PF 1.19, fee-negative  
+//   + h=144, sep=0.003:      PF 1.24, net $6K
+//   + regime ON:             PF 1.35, net $22K
+//   + trail 0.15%:           PF 1.38, net $26K
+//   + profit lock 72b/50%:   PF 1.49, net $33K
+//   + lockBars=48:           PF 1.60, net $44K  ← CURRENT
+// ============================================================
+
+strategy("MESA MAMA FAMA Crypto v3.3 BTC",
+     overlay=true,
+     scale=scale.right,
+     process_orders_on_close=false,
+     calc_on_order_fills=true,
+     calc_on_every_tick=true,
+     pyramiding=0)
+
+//====================================================
+// Helpers
+//====================================================
+f_clamp(_x, _lo, _hi) =>
+    math.max(_lo, math.min(_x, _hi))
+
+f_priceTxt(_p) =>
+    str.tostring(_p, format.mintick)
+
+f_labelY(_isUp, _mult) =>
+    float a = nz(ta.atr(14))
+    float pad = a * _mult
+    _isUp ? (low - pad) : (high + pad)
+
+//====================================================
+// Trade Logic Switches
+//====================================================
+grpLogic = "Trade Logic"
+dirMode       = input.string("Both", "Trade Direction", ["Both", "Long only", "Short only"], group=grpLogic)
+flipMode      = input.string("Allow at close", "Opposite Flip Handling", ["Allow at close", "Disallow same-bar flip", "Auto (<23m disallow)"], group=grpLogic)
+useSwingLogic = input.bool(true, "Enable Swing Trade Mode", group=grpLogic)
+
+
+//====================================================
+// Exit Management (unchanged from v3.1)
+//====================================================
+grpExit = "Exit Management"
+
+useBEStop       = input.bool(true, "Enable Breakeven Stop", group=grpExit, tooltip="Move stop to entry after trade reaches MFE threshold")
+beTriggerPct    = input.float(0.30, "BE Trigger (% profit to activate)", step=0.01, group=grpExit, tooltip="Once unrealized profit hits this %, stop moves to entry")
+beOffsetPct     = input.float(0.02, "BE Offset (% above/below entry)", step=0.01, group=grpExit, tooltip="Small buffer above entry to cover fees. 0 = exact breakeven")
+
+useMamaTrail    = input.bool(true, "Enable MAMA Trailing Exit", group=grpExit, tooltip="Exit when price crosses MAMA (tighter than waiting for MAMA/FAMA cross)")
+mamaTrailMinPct = input.float(0.15, "MAMA Trail Min Profit (%)", step=0.01, group=grpExit, tooltip="Only activate MAMA trailing once trade is this % in profit")
+
+useProfitLock   = input.bool(true, "Enable Time-Based Profit Lock", group=grpExit, tooltip="After lockBars, if trade peaked above lockMinPct, exit if profit retraces below lockRetracePct of peak")
+lockBars        = input.int(48, "Profit Lock Delay (bars)", minval=0, group=grpExit, tooltip="Bars after entry before profit lock activates. 48 = 4h on 5m chart")
+lockMinPct      = input.float(0.15, "Profit Lock Min Peak (%)", step=0.01, group=grpExit, tooltip="Trade must have peaked above this % to activate lock")
+lockRetracePct  = input.float(50.0, "Profit Lock Retrace (%)", step=5.0, minval=10.0, maxval=90.0, group=grpExit, tooltip="Exit if unrealized drops below this % of peak. 50 = exit when half of peak profit is gone")
+
+useMinHold      = input.bool(true, "Enable Minimum Hold Time", group=grpExit, tooltip="Prevent exits before N bars have elapsed since entry")
+minHoldBars     = input.int(144, "Min Hold Bars", minval=0, group=grpExit, tooltip="144 bars on 5m = 12h. Optimized for BTC — eliminates unprofitable sub-12h exits.")
+
+//====================================================
+// Regime Filter
+//====================================================
+grpRegime = "Regime Filter"
+useRegimeFilter = input.bool(true, "Enable Regime Filter", group=grpRegime, tooltip="Suppress counter-trend trades using EMA direction")
+regimeEmaLen    = input.int(200, "Regime EMA Length", minval=10, group=grpRegime)
+regimeMode      = input.string("Suppress counter-trend", "Regime Mode", ["Suppress counter-trend", "Trend-aligned only"], group=grpRegime)
+
+//====================================================
+// Maker Payload Controls (Node Bridge)
+//====================================================
+grpMaker = "Maker Payload (for Node Bridge)"
+tvToken          = input.string("mySuperSecretWebhook123", "TV Token (must match server)", group=grpMaker)
+sendAlerts       = input.bool(true, "Send Alerts to Bridge", group=grpMaker)
+entryOffsetPctIn = input.float(0.02, "Entry Offset % (maker limit)", step=0.01, group=grpMaker)
+exitOffsetPctIn  = input.float(0.01, "Exit Offset % (flatten maker hint)", step=0.01, group=grpMaker)
+
+tpEnabledIn      = input.bool(true, "TP Enabled (payload -> Node)", group=grpMaker)
+tpPctIn          = input.float(0.50, "TP % (payload -> Node)", step=0.01, group=grpMaker)
+
+//====================================================
+// Sizing (Margin % of Equity)
+//====================================================
+grpRisk   = "Sizing (Margin % of Equity)"
+posPct    = input.float(10.0, "Margin % per Trade", step=0.1, group=grpRisk) / 100
+LVXmax    = input.float(5.0,  "Max Leverage", group=grpRisk)
+LVXmin    = input.float(1.0,  "Min Leverage", group=grpRisk)
+
+grpPerp = "Contract Settings"
+useFractionalQty = input.bool(true, "Use Fractional Qty (crypto)", group=grpPerp, tooltip="Enable for crypto perpetuals. Sizes in fractional BASE units (e.g. 0.005 BTC)")
+minQty            = input.float(0.001, "Min Qty", step=0.001, group=grpPerp, tooltip="Minimum order size in BASE units. BTC=0.001, ETH=0.01")
+contractValue     = input.float(1.0, "Contract Value (BASE units per contract)", step=0.000001, group=grpPerp)
+minContracts      = input.int(1, "Min Contracts", minval=1, group=grpPerp)
+maxContracts      = input.int(1000000, "Max Contracts", minval=1, group=grpPerp)
+
+levTarget = LVXmax
+equity = strategy.equity
+targetMargin   = equity * posPct
+targetNotional = targetMargin * levTarget
+
+float qtyContracts = 0.0
+if useFractionalQty
+    // Fractional mode: size in BASE units, round to minQty step
+    float rawQty = targetNotional / close
+    float minLevQty = (equity * posPct * LVXmin) / close
+    float maxLevQty = (equity * posPct * LVXmax) / close
+    float clampedQty = math.max(minLevQty, math.min(rawQty, maxLevQty))
+    // Round down to nearest minQty step
+    float stepped = math.floor(clampedQty / minQty) * minQty
+    qtyContracts := math.max(minQty, stepped)
+else
+    // Integer contract mode (original)
+    float contractsRaw = (contractValue > 0 and close > 0) ? (targetNotional / (contractValue * close)) : 0.0
+    float contractsInt = math.floor(contractsRaw)
+    float contractsMinLevRaw = (contractValue > 0 and close > 0) ? ((equity * posPct) * LVXmin) / (contractValue * close) : 0.0
+    float contractsMaxLevRaw = (contractValue > 0 and close > 0) ? ((equity * posPct) * LVXmax) / (contractValue * close) : 0.0
+    float contractsFloatClamped = math.max(contractsMinLevRaw, math.min(contractsInt, contractsMaxLevRaw))
+    qtyContracts := math.max(minContracts, math.min(math.floor(contractsFloatClamped), maxContracts))
+
+//====================================================
+// Symbol normalization
+//====================================================
+string symRaw  = syminfo.ticker
+string symNorm = str.replace_all(symRaw, ".P", "")
+
+//====================================================
+// ATR Filter
+//====================================================
+grpATR = "ATR Filter"
+useAtrFilter     = input.bool(true, "Enable ATR% Filter", group=grpATR)
+atrLen           = input.int(14, "ATR Length", minval=1, group=grpATR)
+useSymbolPresets = input.bool(true, "Use per-symbol ATR% presets", group=grpATR)
+
+minAtrPctGlobal  = input.float(0.10, "Min ATR% (Global)", step=0.01, group=grpATR)
+
+minAtrPctBTC  = input.float(0.07, "BTCUSDT Min ATR%", step=0.01, group=grpATR)
+minAtrPctETH  = input.float(0.09, "ETHUSDT Min ATR%", step=0.01, group=grpATR)
+minAtrPctSOL  = input.float(0.12, "SOLUSDT Min ATR%", step=0.01, group=grpATR)
+minAtrPctAVAX = input.float(0.14, "AVAXUSDT Min ATR%", step=0.01, group=grpATR)
+minAtrPctADA  = input.float(0.10, "ADAUSDT Min ATR%", step=0.01, group=grpATR)
+minAtrPctXRP  = input.float(0.10, "XRPUSDT Min ATR%", step=0.01, group=grpATR)
+minAtrPctLTC  = input.float(0.09, "LTCUSDT Min ATR%", step=0.01, group=grpATR)
+
+atr    = ta.atr(atrLen)
+atrPct = close > 0 ? (atr / close) * 100.0 : na
+
+float minAtrPctActive = minAtrPctGlobal
+
+if useSymbolPresets
+    if symNorm == "BTCUSDT"
+        minAtrPctActive := minAtrPctBTC
+    else if symNorm == "ETHUSDT"
+        minAtrPctActive := minAtrPctETH
+    else if symNorm == "SOLUSDT"
+        minAtrPctActive := minAtrPctSOL
+    else if symNorm == "AVAXUSDT"
+        minAtrPctActive := minAtrPctAVAX
+    else if symNorm == "ADAUSDT"
+        minAtrPctActive := minAtrPctADA
+    else if symNorm == "XRPUSDT"
+        minAtrPctActive := minAtrPctXRP
+    else if symNorm == "LTCUSDT"
+        minAtrPctActive := minAtrPctLTC
+    else
+        minAtrPctActive := minAtrPctGlobal
+else
+    minAtrPctActive := minAtrPctGlobal
+
+atrEps = 1e-6
+atrOk = not useAtrFilter or (not na(atrPct) and atrPct + atrEps >= minAtrPctActive)
+
+//====================================================
+// MESA MAMA / FAMA (unchanged)
+//====================================================
+grpMesa = "MESA Settings"
+mesa_src     = input.source(hl2, "MESA Source", group=grpMesa)
+fastLimit    = input.float(0.38, "Fast Limit", minval=0.01, maxval=1.0, group=grpMesa, tooltip="Crypto recommended: 0.35-0.40")
+slowLimit    = input.float(0.035, "Slow Limit", minval=0.001, maxval=0.5, group=grpMesa, tooltip="Crypto recommended: 0.03-0.04")
+sepThreshold = input.float(0.003, "Separation Threshold (% of close)", step=0.0001, group=grpMesa, tooltip="0.003 = 0.3% of price. Filters weak crossovers. Optimized for BTC.")
+
+f_mama_fama_crypto(_src, _fast, _slow) =>
+    smooth = (4.0*_src + 3.0*nz(_src[1]) + 2.0*nz(_src[2]) + nz(_src[3])) / 10.0
+
+    var float detrender = na
+    var float I1 = na
+    var float Q1 = na
+    var float jI = na
+    var float jQ = na
+    var float I2 = na
+    var float Q2 = na
+    var float Re = na
+    var float Im = na
+    var float period = 0.0
+    var float phase = 0.0
+    var float deltaPhase = 0.0
+    var float alpha = 0.0
+    var float mama = na
+    var float fama = na
+
+    adj = 0.075*nz(period[1]) + 0.54
+
+    detrender := (0.0962*smooth + 0.5769*nz(smooth[2]) - 0.5769*nz(smooth[4]) - 0.0962*nz(smooth[6])) * adj
+
+    Q1 := (0.0962*detrender + 0.5769*nz(detrender[2]) - 0.5769*nz(detrender[4]) - 0.0962*nz(detrender[6])) * adj
+    I1 := nz(detrender[3])
+
+    jI := (0.0962*I1 + 0.5769*nz(I1[2]) - 0.5769*nz(I1[4]) - 0.0962*nz(I1[6])) * adj
+    jQ := (0.0962*Q1 + 0.5769*nz(Q1[2]) - 0.5769*nz(Q1[4]) - 0.0962*nz(Q1[6])) * adj
+
+    I2 := I1 - jQ
+    Q2 := Q1 + jI
+
+    I2 := 0.2*I2 + 0.8*nz(I2[1])
+    Q2 := 0.2*Q2 + 0.8*nz(Q2[1])
+
+    Re := I2*nz(I2[1]) + Q2*nz(Q2[1])
+    Im := I2*nz(Q2[1]) - Q2*nz(I2[1])
+
+    Re := 0.2*Re + 0.8*nz(Re[1])
+    Im := 0.2*Im + 0.8*nz(Im[1])
+
+    float p1 = nz(period[1])
+    if (Im != 0 and Re != 0)
+        p1 := 2.0*math.pi / math.atan(Im / Re)
+    
+    p1 := math.max(p1, 0.67 * nz(period[1]))
+    p1 := math.min(p1, 1.5 * nz(period[1]))
+    p1 := f_clamp(p1, 6.0, 50.0)
+    period := 0.2*p1 + 0.8*nz(period[1])
+
+    phase := (I1 != 0) ? (math.atan(Q1 / I1) * 180.0 / math.pi) : nz(phase[1])
+    
+    deltaPhase := nz(phase[1]) - phase
+    if deltaPhase < 1
+        deltaPhase := 1
+
+    alpha := _fast / deltaPhase
+    alpha := f_clamp(alpha, _slow, _fast)
+
+    mama := alpha*_src + (1 - alpha)*nz(mama[1])
+    fama := 0.5*alpha*mama + (1 - 0.5*alpha)*nz(fama[1])
+
+    [mama, fama, alpha, deltaPhase, period]
+
+[mama, fama, alpha, deltaPhase, period] = f_mama_fama_crypto(mesa_src, fastLimit, slowLimit)
+
+plotMama = plot(mama, color=color.red, title="MAMA", linewidth=2)
+plotFama = plot(fama, color=color.green, title="FAMA", linewidth=2)
+fill(plotMama, plotFama, color=mama > fama ? color.new(color.green, 85) : color.new(color.red, 85), title="MAMA/FAMA Fill")
+
+//====================================================
+// Regime Filter
+//====================================================
+regimeEma = ta.ema(close, regimeEmaLen)
+bullRegime = close > regimeEma
+bearRegime = close < regimeEma
+
+plot(useRegimeFilter ? regimeEma : na, "Regime EMA", color=color.new(color.white, 60), linewidth=1, style=plot.style_stepline)
+
+//====================================================
+// Signal Generation (unchanged from v3.1.1)
+//====================================================
+diffOk = sepThreshold <= 0 ? true : (math.abs(mama - fama) / close > sepThreshold)
+
+wantLong  = dirMode != "Short only"
+wantShort = dirMode != "Long only"
+
+if useRegimeFilter
+    if regimeMode == "Suppress counter-trend"
+        if bearRegime
+            wantLong := false
+        if bullRegime
+            wantShort := false
+    else
+        wantLong  := wantLong and bullRegime
+        wantShort := wantShort and bearRegime
+
+mamaCrossUp   = ta.crossover(mama, fama)
+mamaCrossDown = ta.crossunder(mama, fama)
+
+var bool pendingLong = false
+var bool pendingShort = false
+
+if mamaCrossUp
+    pendingLong := true
+    pendingShort := false
+if mamaCrossDown
+    pendingShort := true
+    pendingLong := false
+
+if pendingLong and mama < fama
+    pendingLong := false
+if pendingShort and mama > fama
+    pendingShort := false
+
+longSignal  = mama > fama and wantLong
+shortSignal = mama < fama and wantShort
+
+longSignalChanged  = pendingLong and diffOk and wantLong
+shortSignalChanged = pendingShort and diffOk and wantShort
+
+//====================================================
+// Flip Handling
+//====================================================
+tfSeconds = timeframe.in_seconds(timeframe.period)
+tfm = na(tfSeconds) ? na : tfSeconds / 60.0
+autoBlock = not na(tfm) and tfm < 23
+blockSameBarFlip = flipMode == "Disallow same-bar flip" or (flipMode == "Auto (<23m disallow)" and autoBlock)
+
+var int cooldownBars = 0
+if barstate.isnew and cooldownBars > 0
+    cooldownBars -= 1
+
+//====================================================
+// Position Tracking
+//====================================================
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+isFlat  = strategy.position_size == 0
+
+canTrade = cooldownBars == 0 and atrOk and qtyContracts > 0
+
+
+//====================================================
+// Trade State Tracking (unchanged from v3.1)
+//====================================================
+var float tradeEntryPrice = na
+var int   tradeEntryBar   = 0
+var bool  beStopActive    = false
+var float tradeMaxPct     = 0.0
+
+// v3.3 anti-churn: track last exit direction and bar
+var int lastExitBar = 0
+var int lastExitDir = 0  // 1=long exit, -1=short exit, 0=none
+int reentryMinBars = 6  // 30 min on 5m chart — prevents rapid same-dir churn
+
+bool newEntry = (isLong and not isLong[1]) or (isShort and not isShort[1])
+bool positionClosed = isFlat and not isFlat[1]
+
+if newEntry
+    tradeEntryPrice := close
+    tradeEntryBar   := bar_index
+    beStopActive    := false
+    tradeMaxPct     := 0.0
+
+if positionClosed
+    tradeEntryPrice := na
+    tradeEntryBar   := 0
+    beStopActive    := false
+    tradeMaxPct     := 0.0
+
+float unrealPct = 0.0
+if not na(tradeEntryPrice) and tradeEntryPrice > 0
+    if isLong
+        unrealPct := (close - tradeEntryPrice) / tradeEntryPrice * 100.0
+    else if isShort
+        unrealPct := (tradeEntryPrice - close) / tradeEntryPrice * 100.0
+
+if unrealPct > tradeMaxPct
+    tradeMaxPct := unrealPct
+
+if useBEStop and not beStopActive and tradeMaxPct >= beTriggerPct
+    beStopActive := true
+
+int barsHeld = bar_index - tradeEntryBar
+bool holdTimeMet = not useMinHold or barsHeld >= minHoldBars
+
+//====================================================
+// Exit Signal Evaluation (identical to v3.1.1)
+//====================================================
+
+// --- Breakeven stop exit (unchanged) ---
+float beExitPrice = na
+if useBEStop and beStopActive and not na(tradeEntryPrice)
+    if isLong
+        beExitPrice := tradeEntryPrice * (1.0 + beOffsetPct / 100.0)
+    else if isShort
+        beExitPrice := tradeEntryPrice * (1.0 - beOffsetPct / 100.0)
+
+bool beStopHit = false
+if not na(beExitPrice)
+    if isLong and close <= beExitPrice
+        beStopHit := true
+    if isShort and close >= beExitPrice
+        beStopHit := true
+
+// --- MAMA trailing exit (unchanged) ---
+bool mamaTrailExit = false
+if useMamaTrail and unrealPct >= mamaTrailMinPct
+    if isLong and close < mama
+        mamaTrailExit := true
+    if isShort and close > mama
+        mamaTrailExit := true
+
+// --- Time-based profit lock exit (v3.3) ---
+// After lockBars, if trade peaked above lockMinPct, exit when
+// unrealized profit retraces below lockRetracePct% of peak.
+bool profitLockExit = false
+if useProfitLock and barsHeld >= lockBars and tradeMaxPct >= lockMinPct
+    float lockFloor = tradeMaxPct * (lockRetracePct / 100.0)
+    if unrealPct < lockFloor
+        profitLockExit := true
+
+// --- Standard MAMA/FAMA exit (UNCHANGED from v3.1.1) ---
+// Includes both fresh crossover AND stale-state check.
+// This is identical to v3.1.1 — the key insight is that this exit
+// logic was never the problem. The problem was what happened AFTER the exit.
+bool standardExitLong  = mamaCrossDown or (mama < fama and diffOk)
+bool standardExitShort = mamaCrossUp or (mama > fama and diffOk)
+
+bool holdExpiredAgainstLong  = holdTimeMet and isLong and mama < fama
+bool holdExpiredAgainstShort = holdTimeMet and isShort and mama > fama
+
+// --- Combined exit logic ---
+bool exitLongSignal  = false
+bool exitShortSignal = false
+string exitReason    = ""
+
+if isLong
+    if beStopHit
+        exitLongSignal := true
+        exitReason := "BE_STOP"
+    else if holdTimeMet and mamaTrailExit
+        exitLongSignal := true
+        exitReason := "MAMA_TRAIL"
+    else if profitLockExit
+        exitLongSignal := true
+        exitReason := "PROFIT_LOCK"
+    else if holdTimeMet and standardExitLong
+        exitLongSignal := true
+        exitReason := "CROSS_EXIT"
+    else if holdExpiredAgainstLong
+        exitLongSignal := true
+        exitReason := "CROSS_EXIT"
+
+if isShort
+    if beStopHit
+        exitShortSignal := true
+        exitReason := "BE_STOP"
+    else if holdTimeMet and mamaTrailExit
+        exitShortSignal := true
+        exitReason := "MAMA_TRAIL"
+    else if profitLockExit
+        exitShortSignal := true
+        exitReason := "PROFIT_LOCK"
+    else if holdTimeMet and standardExitShort
+        exitShortSignal := true
+        exitReason := "CROSS_EXIT"
+    else if holdExpiredAgainstShort
+        exitShortSignal := true
+        exitReason := "CROSS_EXIT"
+
+// --- Reversal signals (Cases 1 & 2 — signal-driven, unchanged) ---
+bool canReverseLong  = holdTimeMet and shortSignalChanged and wantShort and canTrade
+bool canReverseShort = holdTimeMet and longSignalChanged and wantLong and canTrade
+
+//====================================================
+// Visual Settings
+//====================================================
+grpViz = "Visual / Labels"
+showAlertLabels = input.bool(true, "Show Alert Labels", group=grpViz)
+showDiagTable   = input.bool(true, "Show Diagnostics Table", group=grpViz)
+showExitLabels  = input.bool(true, "Show Exit Reason Labels", group=grpViz)
+
+//====================================================
+// JSON Payload Builder (unchanged)
+//====================================================
+f_jsonEscape(_s) =>
+    str.replace_all(str.replace_all(_s, "\\", "\\\\"), "\"", "\\\"")
+
+f_payload(_action, _comment, _orderId) =>
+    string entryOff = str.tostring(entryOffsetPctIn)
+    string exitOff  = str.tostring(exitOffsetPctIn)
+    string aLen     = str.tostring(atrLen)
+    string aPct     = str.tostring(atrPct, "#.####")
+    string minAtr   = str.tostring(minAtrPctActive)
+    string tpEn     = tpEnabledIn ? "true" : "false"
+    string tpPct    = str.tostring(tpPctIn)
+
+    string payload = "{"
+    payload += "\"token\":\""        + tvToken                            + "\","
+    payload += "\"action\":\""       + f_jsonEscape(_action)              + "\","
+    payload += "\"symbol\":\""       + f_jsonEscape(symNorm)              + "\","
+    payload += "\"symbolRaw\":\""    + f_jsonEscape(symRaw)               + "\","
+    payload += "\"comment\":\""      + f_jsonEscape(_comment)             + "\","
+    payload += "\"orderId\":\""      + f_jsonEscape(_orderId)             + "\","
+    payload += "\"entryOffsetPct\":" + entryOff                           + ","
+    payload += "\"exitOffsetPct\":"  + exitOff                            + ","
+    payload += "\"tpEnabled\":"      + tpEn                               + ","
+    payload += "\"tpPct\":"          + tpPct                              + ","
+    payload += "\"atrLen\":"         + aLen                               + ","
+    payload += "\"atrPct\":"         + aPct                               + ","
+    payload += "\"minAtrPct\":"      + minAtr                             + ","
+    payload += "\"price\":\""        + str.tostring(close)                + "\","
+    payload += "\"mama\":\""         + str.tostring(mama, "#.##")         + "\","
+    payload += "\"fama\":\""         + str.tostring(fama, "#.##")         + "\","
+    payload += "\"exitReason\":\""   + f_jsonEscape(exitReason)           + "\","
+    payload += "\"unrealPct\":\""    + str.tostring(unrealPct, "#.###")   + "\","
+    payload += "\"beActive\":\""     + (beStopActive ? "true" : "false")  + "\","
+    payload += "\"barsHeld\":\""     + str.tostring(barsHeld)             + "\","
+    payload += "\"tf\":\""           + f_jsonEscape(timeframe.period)     + "\""
+    payload += "}"
+    payload
+
+//====================================================
+// Trading Logic (v3.3 — identical to v3.1.1, only minHoldBars changed 36→60)
+//====================================================
+var int lastActionBar = -1
+var int lastLabelBar = -1
+
+bool canActThisBar = bar_index != lastActionBar
+bool reversedThisBar = false
+bool exitedThisBar = false
+
+if barstate.isconfirmed and canActThisBar
+
+    //----------------------------------------------------
+    // CASE 1: REVERSAL Long → Short (signal-driven, unchanged)
+    //----------------------------------------------------
+    if useSwingLogic and isLong and canReverseLong and not beStopHit
+        strategy.close_all()
+        strategy.entry("Short", strategy.short, qty=qtyContracts)
+        reversedThisBar := true
+        lastActionBar := bar_index
+        pendingShort := false
+        
+        if sendAlerts
+            alert(f_payload("reverse_short", "ReverseToShort", "rev_s_" + str.tostring(bar_index)), alert.freq_once_per_bar_close)
+        if showAlertLabels and bar_index != lastLabelBar
+            label.new(bar_index, f_labelY(false, 1.5), "REVERSE → SHORT @ " + f_priceTxt(close), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, textcolor=color.white, color=color.new(color.purple, 0))
+            lastLabelBar := bar_index
+
+    //----------------------------------------------------
+    // CASE 2: REVERSAL Short → Long (signal-driven, unchanged)
+    //----------------------------------------------------
+    else if useSwingLogic and isShort and canReverseShort and not beStopHit
+        strategy.close_all()
+        strategy.entry("Long", strategy.long, qty=qtyContracts)
+        reversedThisBar := true
+        lastActionBar := bar_index
+        pendingLong := false
+        
+        if sendAlerts
+            alert(f_payload("reverse_long", "ReverseToLong", "rev_l_" + str.tostring(bar_index)), alert.freq_once_per_bar_close)
+        if showAlertLabels and bar_index != lastLabelBar
+            label.new(bar_index, f_labelY(true, 1.5), "REVERSE → LONG @ " + f_priceTxt(close), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up, textcolor=color.white, color=color.new(color.purple, 0))
+            lastLabelBar := bar_index
+
+    //----------------------------------------------------
+    // CASE 3: EXIT Long (with optional reverse — identical to v3.1.1)
+    //----------------------------------------------------
+    else if isLong and exitLongSignal and not reversedThisBar
+        bool canReverseOnExit = useSwingLogic and exitReason == "CROSS_EXIT" and mama < fama and wantShort and canTrade
+        if canReverseOnExit
+            strategy.close_all()
+            strategy.entry("Short", strategy.short, qty=qtyContracts)
+            reversedThisBar := true
+            lastActionBar := bar_index
+            if sendAlerts
+                alert(f_payload("reverse_short", "ExitReverse", "exrev_s_" + str.tostring(bar_index)), alert.freq_once_per_bar_close)
+            if showAlertLabels and bar_index != lastLabelBar
+                label.new(bar_index, f_labelY(false, 1.5), "EXIT\u2192REV SHORT @ " + f_priceTxt(close), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, textcolor=color.white, color=color.new(color.fuchsia, 0))
+                lastLabelBar := bar_index
+        else
+            strategy.close("Long")
+            exitedThisBar := true
+            lastActionBar := bar_index
+            lastExitBar := bar_index
+            lastExitDir := 1  // exited long
+            color exitColor = exitReason == "BE_STOP" ? color.new(color.yellow, 0) : exitReason == "MAMA_TRAIL" ? color.new(color.aqua, 0) : exitReason == "PROFIT_LOCK" ? color.new(color.lime, 0) : color.new(color.orange, 0)
+            string exitLabel = exitReason == "BE_STOP" ? "BE EXIT" : exitReason == "MAMA_TRAIL" ? "MAMA TRAIL EXIT" : exitReason == "PROFIT_LOCK" ? "PROFIT LOCK EXIT" : "EXIT"
+            if sendAlerts
+                alert(f_payload("flatten_long", exitLabel + " Long", "exit_l_" + str.tostring(bar_index)), alert.freq_once_per_bar_close)
+            if showAlertLabels and bar_index != lastLabelBar
+                label.new(bar_index, f_labelY(false, 2.0), exitLabel + " LONG @ " + f_priceTxt(close), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, textcolor=color.white, color=exitColor)
+                lastLabelBar := bar_index
+
+    //----------------------------------------------------
+    // CASE 4: EXIT Short (with optional reverse — identical to v3.1.1)
+    //----------------------------------------------------
+    else if isShort and exitShortSignal and not reversedThisBar
+        bool canReverseOnExitS = useSwingLogic and exitReason == "CROSS_EXIT" and mama > fama and wantLong and canTrade
+        if canReverseOnExitS
+            strategy.close_all()
+            strategy.entry("Long", strategy.long, qty=qtyContracts)
+            reversedThisBar := true
+            lastActionBar := bar_index
+            if sendAlerts
+                alert(f_payload("reverse_long", "ExitReverse", "exrev_l_" + str.tostring(bar_index)), alert.freq_once_per_bar_close)
+            if showAlertLabels and bar_index != lastLabelBar
+                label.new(bar_index, f_labelY(true, 1.5), "EXIT\u2192REV LONG @ " + f_priceTxt(close), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up, textcolor=color.white, color=color.new(color.fuchsia, 0))
+                lastLabelBar := bar_index
+        else
+            strategy.close("Short")
+            exitedThisBar := true
+            lastActionBar := bar_index
+            lastExitBar := bar_index
+            lastExitDir := -1  // exited short
+            color exitColor = exitReason == "BE_STOP" ? color.new(color.yellow, 0) : exitReason == "MAMA_TRAIL" ? color.new(color.aqua, 0) : exitReason == "PROFIT_LOCK" ? color.new(color.lime, 0) : color.new(color.orange, 0)
+            string exitLabel = exitReason == "BE_STOP" ? "BE EXIT" : exitReason == "MAMA_TRAIL" ? "MAMA TRAIL EXIT" : exitReason == "PROFIT_LOCK" ? "PROFIT LOCK EXIT" : "EXIT"
+            if sendAlerts
+                alert(f_payload("flatten_short", exitLabel + " Short", "exit_s_" + str.tostring(bar_index)), alert.freq_once_per_bar_close)
+            if showAlertLabels and bar_index != lastLabelBar
+                label.new(bar_index, f_labelY(true, 2.0), exitLabel + " SHORT @ " + f_priceTxt(close), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up, textcolor=color.white, color=exitColor)
+                lastLabelBar := bar_index
+
+    //----------------------------------------------------
+    // CASE 5: Non-swing exits (if swing mode disabled)
+    //----------------------------------------------------
+    else if not useSwingLogic
+        if isLong and mama < fama and holdTimeMet
+            strategy.close("Long")
+            exitedThisBar := true
+            lastActionBar := bar_index
+        if isShort and mama > fama and holdTimeMet
+            strategy.close("Short")
+            exitedThisBar := true
+            lastActionBar := bar_index
+
+    //----------------------------------------------------
+    // CASE 6: FRESH ENTRY from flat (unchanged)
+    // This fires on the same bar as Case 3/4 exits when isFlat becomes true.
+    // So the strategy CAN re-enter immediately if a signal exists — 
+    // no cooldown, no missed opportunities.
+    //----------------------------------------------------
+    // v3.3 anti-churn: block same-direction re-entry within reentryMinBars
+    bool longCooldown  = lastExitDir == 1 and (bar_index - lastExitBar) < reentryMinBars
+    bool shortCooldown = lastExitDir == -1 and (bar_index - lastExitBar) < reentryMinBars
+
+    if canTrade and not reversedThisBar and isFlat
+        if longSignalChanged and not longCooldown
+            strategy.entry("Long", strategy.long, qty=qtyContracts)
+            lastActionBar := bar_index
+            pendingLong := false
+            
+            if sendAlerts
+                alert(f_payload("buy", "Long", "long_" + str.tostring(bar_index)), alert.freq_once_per_bar_close)
+            if showAlertLabels and bar_index != lastLabelBar
+                label.new(bar_index, f_labelY(true, 1.0), "LONG @ " + f_priceTxt(close), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0))
+                lastLabelBar := bar_index
+                    
+        else if shortSignalChanged and not shortCooldown
+            strategy.entry("Short", strategy.short, qty=qtyContracts)
+            lastActionBar := bar_index
+            pendingShort := false
+            
+            if sendAlerts
+                alert(f_payload("sell", "Short", "short_" + str.tostring(bar_index)), alert.freq_once_per_bar_close)
+            if showAlertLabels and bar_index != lastLabelBar
+                label.new(bar_index, f_labelY(false, 1.0), "SHORT @ " + f_priceTxt(close), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0))
+                lastLabelBar := bar_index
+
+// Cooldown after reversal/exit
+if (reversedThisBar or exitedThisBar) and blockSameBarFlip
+    cooldownBars := 1
+
+//====================================================
+// Visual Elements
+//====================================================
+bgcolor(atrOk ? color.new(color.green, 95) : color.new(color.red, 95), title="ATR Status")
+
+plot(useBEStop and beStopActive and not na(beExitPrice) ? beExitPrice : na, "BE Stop Level", color=color.new(color.yellow, 30), linewidth=1, style=plot.style_stepline, title="Breakeven Stop")
+
+plot(atrPct, "Current ATR%", color=color.blue, linewidth=1, display=display.none)
+plot(minAtrPctActive, "Min ATR% Threshold", color=color.red, linewidth=1, style=plot.style_circles, display=display.none)
+
+//====================================================
+// Diagnostics Table (v3.3 — added hour status)
+//====================================================
+var table diagTable = table.new(position.bottom_right, 2, 19, bgcolor=color.new(color.black, 85), border_width=1)
+
+impliedNotional    = useFractionalQty ? qtyContracts * close : qtyContracts * contractValue * close
+impliedLevVsMargin = targetMargin > 0 ? impliedNotional / targetMargin : na
+marginPctShown     = posPct * 100
+clampText          = useFractionalQty ? "FRAC" : "INT"
+
+if barstate.islast and showDiagTable
+    int row = 0
+    
+    table.cell(diagTable, 0, row, "MAMA", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(mama, "#.##"), text_color=color.red, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "FAMA", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(fama, "#.##"), text_color=color.green, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Alpha", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(alpha, "#.###"), text_color=color.yellow, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Period", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(period, "#.#"), text_color=color.aqua, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Cross", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, mamaCrossUp ? "▲ UP" : mamaCrossDown ? "▼ DOWN" : "—", text_color=mamaCrossUp ? color.green : mamaCrossDown ? color.red : color.gray, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Pending", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, pendingLong ? "LONG" : pendingShort ? "SHORT" : "—", text_color=pendingLong ? color.green : pendingShort ? color.red : color.gray, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "State", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, longSignal ? "BULLISH" : shortSignal ? "BEARISH" : "NEUTRAL", text_color=longSignal ? color.green : shortSignal ? color.red : color.gray, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Unreal %", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(unrealPct, "#.###") + "%", text_color=unrealPct > 0 ? color.green : unrealPct < 0 ? color.red : color.gray, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Peak %", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(tradeMaxPct, "#.###") + "%", text_color=color.aqua, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "BE Stop", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, beStopActive ? "ACTIVE" : useBEStop ? "armed" : "OFF", text_color=beStopActive ? color.yellow : color.gray, text_size=size.small)
+    row += 1
+    
+    bool lockActive = useProfitLock and barsHeld >= lockBars and tradeMaxPct >= lockMinPct
+    float lockFloorDisp = lockActive ? tradeMaxPct * (lockRetracePct / 100.0) : na
+    table.cell(diagTable, 0, row, "Profit Lock", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, lockActive ? "ACTIVE " + str.tostring(lockFloorDisp, "#.##") + "%" : useProfitLock ? "armed" : "OFF", text_color=lockActive ? color.lime : color.gray, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Hold", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(barsHeld) + "/" + str.tostring(minHoldBars) + (holdTimeMet ? " ✓" : " ✗"), text_color=holdTimeMet ? color.green : color.orange, text_size=size.small)
+    row += 1
+
+    string regimeText = not useRegimeFilter ? "OFF" : bullRegime ? "BULL" : "BEAR"
+    color regimeColor = not useRegimeFilter ? color.gray : bullRegime ? color.green : color.red
+    table.cell(diagTable, 0, row, "Regime", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, regimeText, text_color=regimeColor, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Position", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(strategy.position_size), text_color=strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Qty", text_color=color.white, text_size=size.small)
+    string qtyText = useFractionalQty ? str.tostring(qtyContracts, "#.######") + " (" + clampText + ")" : str.tostring(qtyContracts) + " (" + clampText + ")"
+    table.cell(diagTable, 1, row, qtyText, text_color=color.white, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Leverage", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(impliedLevVsMargin, "#.#") + "x", text_color=color.yellow, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "ATR%", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, str.tostring(atrPct, "#.##") + " / " + str.tostring(minAtrPctActive, "#.##"), text_color=atrOk ? color.green : color.red, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Can Trade", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, canTrade ? "YES" : "NO", text_color=canTrade ? color.green : color.red, text_size=size.small)
+    row += 1
+    
+    table.cell(diagTable, 0, row, "Symbol", text_color=color.white, text_size=size.small)
+    table.cell(diagTable, 1, row, symNorm, text_color=color.white, text_size=size.small)

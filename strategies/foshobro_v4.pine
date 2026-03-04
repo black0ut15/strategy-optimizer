@@ -1,0 +1,519 @@
+// ============================================================
+// Kenny Glick — Fo' Sho' Bro (F.O.S.H.O.) Indicator v4
+// ============================================================
+// CHART: 1-minute | Extended Hours ON
+// ============================================================
+
+//@version=5
+indicator(
+     title     = "Fo' Sho' Bro v4 — Kenny Glick",
+     shorttitle= "FSB",
+     overlay   = true,
+     max_lines_count  = 300,
+     max_labels_count = 300,
+     max_bars_back    = 5000)
+
+// ══════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════
+
+var GV = "📊 VWAP Lines"
+show_today = input.bool(true, "Today VWAP (Blue)",        group=GV)
+show_pd    = input.bool(true, "Prior Day VWAP (Orange)",  group=GV)
+show_3d    = input.bool(true, "3-Day VWAP",               group=GV)
+show_4d    = input.bool(false,"4-Day VWAP",               group=GV)
+show_fill  = input.bool(true, "Fill VWAP Channel",        group=GV)
+
+var GS = "🎯 Signal Settings"
+show_signals   = input.bool(true,   "Show Entry Signals",              group=GS)
+show_stops     = input.bool(true,   "Show Stop Lines",                 group=GS)
+show_targets   = input.bool(true,   "Show Target Lines",               group=GS)
+min_flush_pct  = input.float(0.20,  "Min Flush % (below VWAP)",        group=GS, minval=0.05, maxval=2.0, step=0.05,
+     tooltip="Price must break this far below VWAP to qualify. 0.20% on $100 stock = 20 cents.")
+min_bars_below = input.int(3,       "Min Bars Below VWAP",             group=GS, minval=1, maxval=30,
+     tooltip="Must stay below VWAP for N bars to confirm shake-out.")
+cooldown_bars  = input.int(30,      "Cooldown Bars After Signal",      group=GS, minval=10, maxval=200,
+     tooltip="Lock out new signals for N bars after one fires.")
+max_signals    = input.int(3,       "Max Signals Per Session",         group=GS, minval=1, maxval=10,
+     tooltip="Hard cap on total signals per direction per day.")
+session_only   = input.bool(true,   "Regular Session Only (9:35–4 PM)",group=GS,
+     tooltip="Suppress all signals outside regular market hours.")
+
+var GP = "🔍 Pattern Labels"
+show_andy  = input.bool(true,  "Andy Defrain (Coil)",   group=GP)
+show_kard  = input.bool(true,  "Kardashian Bottom",     group=GP)
+andy_bars  = input.int(12,     "Andy: Min Bars",        group=GP, minval=6,  maxval=60)
+andy_pct   = input.float(0.20, "Andy: Max Range %",     group=GP, minval=0.05, maxval=1.0, step=0.05)
+andy_cd    = input.int(30,     "Andy: Cooldown Bars",   group=GP, minval=5,  maxval=200,
+     tooltip="Minimum bars between Andy Defrain labels.")
+kard_tol   = input.float(0.20, "Kardashian: Tol %",     group=GP, minval=0.05, maxval=1.0, step=0.05)
+kard_cd    = input.int(50,     "Kardashian: Cooldown",  group=GP, minval=10, maxval=300,
+     tooltip="Minimum bars between Kardashian Bottom labels.")
+
+var GC = "🎨 Colors"
+c_today = input.color(color.new(#2196F3, 0),  "Today VWAP",    group=GC)
+c_pd    = input.color(color.new(#FF6D00, 0),  "Prior Day",     group=GC)
+c_3d    = input.color(color.new(#FF6D00, 55), "3-Day",         group=GC)
+c_4d    = input.color(color.new(#FF6D00, 75), "4-Day",         group=GC)
+c_long  = input.color(color.new(#00C853, 0),  "Long Signal",   group=GC)
+c_short = input.color(color.new(#D50000, 0),  "Short Signal",  group=GC)
+c_stop  = input.color(color.new(#FF1744, 60), "Stops",         group=GC)
+
+// ══════════════════════════════════════════════════════════
+// SESSION DETECTION
+// ══════════════════════════════════════════════════════════
+
+// Regular session: 9:35 AM – 4:00 PM (skip the chaotic first 5 min)
+in_session = (hour == 9  and minute >= 35) or
+             (hour >= 10 and hour <= 15)   or
+             (hour == 16 and minute == 0)
+
+is_regular_open = session.isfirstbar_regular
+
+// ══════════════════════════════════════════════════════════
+// TODAY'S VWAP
+// ══════════════════════════════════════════════════════════
+
+vwap_today = ta.vwap(hlc3)
+
+// ══════════════════════════════════════════════════════════
+// PRIOR DAY VWAP
+// Anchored from the prior session's open (more reliable than
+// 1 AM in TradingView's extended hours environment).
+// We anchor at the prior regular session open and accumulate
+// through the close, then freeze at today's open.
+// ══════════════════════════════════════════════════════════
+
+// Detect prior day session open — the bar just before today's first regular bar
+// Strategy: accumulate from prior session.isfirstbar_regular onward,
+// freeze when today's session.isfirstbar_regular fires.
+
+var float pd_cum_vp  = na
+var float pd_cum_v   = na
+var float pd_frozen  = na
+var bool  pd_capturing = false
+
+// Start capturing on prior session open
+if is_regular_open
+    // Freeze whatever we had accumulated (that was yesterday's session)
+    if pd_capturing and pd_cum_v > 0
+        pd_frozen := pd_cum_vp / pd_cum_v
+    // Reset for new session accumulation
+    pd_cum_vp    := hlc3 * volume
+    pd_cum_v     := volume
+    pd_capturing := true
+
+else if pd_capturing
+    pd_cum_vp := nz(pd_cum_vp) + hlc3 * volume
+    pd_cum_v  := nz(pd_cum_v)  + volume
+
+// Display: show frozen (yesterday's final VWAP) during today's session
+// Show live accumulation in pre-market / after hours
+vwap_pd = session.ismarket ? pd_frozen :
+          (pd_cum_v > 0    ? pd_cum_vp / pd_cum_v : na)
+
+// ══════════════════════════════════════════════════════════
+// MULTI-DAY VWAPS
+// ══════════════════════════════════════════════════════════
+
+// ~390 bars per regular session (6.5 hrs × 60 min)
+// For extended hours charts, use ~960 bars per day
+int BPD = 960
+
+vwap_3day = bar_index >= BPD * 2 ?
+     math.sum(hlc3 * volume, BPD * 2) / math.max(math.sum(volume, BPD * 2), 1) : na
+
+vwap_4day = bar_index >= BPD * 3 ?
+     math.sum(hlc3 * volume, BPD * 3) / math.max(math.sum(volume, BPD * 3), 1) : na
+
+// ══════════════════════════════════════════════════════════
+// PLOT VWAP LINES
+// ══════════════════════════════════════════════════════════
+
+p_today = plot(show_today ? vwap_today : na, "Today VWAP",     c_today, linewidth=2)
+p_pd    = plot(show_pd    ? vwap_pd    : na, "Prior Day VWAP", c_pd,    linewidth=2)
+p_3d    = plot(show_3d    ? vwap_3day  : na, "3-Day VWAP",    c_3d,    linewidth=1)
+p_4d    = plot(show_4d    ? vwap_4day  : na, "4-Day VWAP",    c_4d,    linewidth=1)
+
+fill(p_today, p_pd,
+     color=show_fill ? color.new(#2196F3, 93) : na,
+     title="VWAP Eb & Flow Channel")
+
+// ══════════════════════════════════════════════════════════
+// FO' SHO' BRO — STATE MACHINE (LONG)
+//
+//  State 0 IDLE:     Price at or above VWAP. Watching.
+//  State 1 FLUSHING: Price broke below by >= min_flush_pct.
+//                    Counting consecutive bars below VWAP.
+//  State 2 ARMED:    Bars-below requirement met. Waiting
+//                    for first close back above VWAP.
+//  State 3 COOLDOWN: Signal fired. Locked out for N bars.
+//
+//  Extra guards:
+//  - session_only: no signals outside 9:35–4 PM
+//  - max_signals:  hard cap per session
+//  - New session low after ARMED → reset (not a clean setup)
+// ══════════════════════════════════════════════════════════
+
+var int   ls          = 0    // long state
+var int   bars_below  = 0
+var int   long_cd     = 0
+var int   long_count  = 0    // signals fired this session
+var float armed_low   = na   // session low when ARMED
+
+var float sess_low = na
+if is_regular_open
+    sess_low    := low
+    ls          := 0
+    bars_below  := 0
+    long_cd     := 0
+    long_count  := 0
+    armed_low   := na
+else if session.ismarket
+    sess_low := math.min(nz(sess_low, low), low)
+
+min_flush  = na(vwap_today) ? 0.0 : vwap_today * (min_flush_pct / 100)
+
+fosho_long = false
+
+if not na(vwap_today) and (not session_only or in_session) and long_count < max_signals
+
+    if ls == 3  // COOLDOWN
+        long_cd += 1
+        if long_cd >= cooldown_bars
+            ls      := 0
+            long_cd := 0
+
+    else if ls == 0  // IDLE
+        if close < vwap_today - min_flush
+            ls         := 1
+            bars_below := 1
+
+    else if ls == 1  // FLUSHING
+        if close < vwap_today
+            bars_below += 1
+            if bars_below >= min_bars_below
+                ls        := 2
+                armed_low := nz(sess_low, low)
+        else
+            // Crossed above too quickly — not a real shake-out
+            ls         := 0
+            bars_below := 0
+
+    else if ls == 2  // ARMED
+        // New session low = setup invalidated
+        if sess_low < armed_low * 0.9985
+            ls         := 0
+            bars_below := 0
+        // Entry: close back above VWAP (any close above qualifies)
+        else if close > vwap_today
+            fosho_long  := true
+            long_count  += 1
+            ls          := 3
+            long_cd     := 0
+            bars_below  := 0
+
+// ══════════════════════════════════════════════════════════
+// FO' SHO' BRO — STATE MACHINE (SHORT, mirror)
+// ══════════════════════════════════════════════════════════
+
+var int   ss           = 0
+var int   bars_above   = 0
+var int   short_cd     = 0
+var int   short_count  = 0
+var float armed_high   = na
+
+var float sess_high = na
+if is_regular_open
+    sess_high    := high
+    ss           := 0
+    bars_above   := 0
+    short_cd     := 0
+    short_count  := 0
+    armed_high   := na
+else if session.ismarket
+    sess_high := math.max(nz(sess_high, high), high)
+
+fosho_short = false
+
+if not na(vwap_today) and (not session_only or in_session) and short_count < max_signals
+
+    if ss == 3
+        short_cd += 1
+        if short_cd >= cooldown_bars
+            ss       := 0
+            short_cd := 0
+
+    else if ss == 0
+        if close > vwap_today + min_flush
+            ss         := 1
+            bars_above := 1
+
+    else if ss == 1
+        if close > vwap_today
+            bars_above += 1
+            if bars_above >= min_bars_below
+                ss         := 2
+                armed_high := nz(sess_high, high)
+        else
+            ss         := 0
+            bars_above := 0
+
+    else if ss == 2
+        if sess_high > armed_high * 1.0015
+            ss         := 0
+            bars_above := 0
+        else if close < vwap_today
+            fosho_short  := true
+            short_count  += 1
+            ss           := 3
+            short_cd     := 0
+            bars_above   := 0
+
+// ══════════════════════════════════════════════════════════
+// ARMED ZONE BACKGROUND
+// ══════════════════════════════════════════════════════════
+
+bgcolor(ls == 2 ? color.new(#FFD600, 95) : na, title="Long ARMED Zone")
+bgcolor(ss == 2 ? color.new(#D50000, 97) : na, title="Short ARMED Zone")
+
+// ══════════════════════════════════════════════════════════
+// ENTRY LABELS
+// ══════════════════════════════════════════════════════════
+
+if fosho_long and show_signals
+    label.new(bar_index, low * 0.9985,
+         "▲ FO' SHO' BRO\nLONG",
+         color=c_long, textcolor=color.white,
+         style=label.style_label_up, size=size.normal)
+
+if fosho_short and show_signals
+    label.new(bar_index, high * 1.0015,
+         "▼ FO' SHO' BRO\nSHORT",
+         color=c_short, textcolor=color.white,
+         style=label.style_label_down, size=size.normal)
+
+// ══════════════════════════════════════════════════════════
+// STOP LINES
+// ══════════════════════════════════════════════════════════
+
+var line sl1 = na
+var line sl2 = na
+var label lb1 = na
+var label lb2 = na
+
+if fosho_long and show_stops
+    line.delete(sl1)
+    line.delete(sl2)
+    label.delete(lb1)
+    label.delete(lb2)
+
+    sl1 := line.new(bar_index - 3, low, bar_index + 40, low,
+         color=c_stop, width=1, style=line.style_dashed)
+    lb1 := label.new(bar_index + 40, low, "S1 " + str.tostring(math.round(low, 2)),
+         color=c_stop, textcolor=color.white,
+         style=label.style_label_left, size=size.small)
+
+    if not na(armed_low) and armed_low < low
+        sl2 := line.new(bar_index - 3, armed_low, bar_index + 40, armed_low,
+             color=c_stop, width=1, style=line.style_dotted)
+        lb2 := label.new(bar_index + 40, armed_low, "S2 " + str.tostring(math.round(armed_low, 2)),
+             color=c_stop, textcolor=color.white,
+             style=label.style_label_left, size=size.small)
+
+// ══════════════════════════════════════════════════════════
+// TARGET LINES  (only on long signal for now)
+// ══════════════════════════════════════════════════════════
+
+var line tl1 = na
+var line tl2 = na
+var line tl3 = na
+var label tl1b = na
+var label tl2b = na
+var label tl3b = na
+
+if fosho_long and show_targets
+    line.delete(tl1)
+    line.delete(tl2)
+    line.delete(tl3)
+    label.delete(tl1b)
+    label.delete(tl2b)
+    label.delete(tl3b)
+
+    if not na(vwap_pd)
+        tl1  := line.new(bar_index, vwap_pd, bar_index + 60, vwap_pd,
+             color=color.new(#FFD600, 20), width=2, style=line.style_dashed)
+        tl1b := label.new(bar_index + 60, vwap_pd,
+             "T1 " + str.tostring(math.round(vwap_pd, 2)),
+             color=color.new(#FFD600, 20), textcolor=color.black,
+             style=label.style_label_left, size=size.small)
+
+    if not na(vwap_3day)
+        tl2  := line.new(bar_index, vwap_3day, bar_index + 60, vwap_3day,
+             color=color.new(#FFD600, 50), width=1, style=line.style_dashed)
+        tl2b := label.new(bar_index + 60, vwap_3day,
+             "T2 " + str.tostring(math.round(vwap_3day, 2)),
+             color=color.new(#FFD600, 50), textcolor=color.black,
+             style=label.style_label_left, size=size.small)
+
+    if not na(vwap_4day)
+        tl3  := line.new(bar_index, vwap_4day, bar_index + 60, vwap_4day,
+             color=color.new(#FFD600, 70), width=1, style=line.style_dotted)
+        tl3b := label.new(bar_index + 60, vwap_4day,
+             "T3 " + str.tostring(math.round(vwap_4day, 2)),
+             color=color.new(#FFD600, 70), textcolor=color.black,
+             style=label.style_label_left, size=size.small)
+
+// ══════════════════════════════════════════════════════════
+// KARDASHIAN BOTTOM
+// Equal double bottom near/below VWAP, with cooldown
+// ══════════════════════════════════════════════════════════
+
+pivot_low = ta.pivotlow(low, 5, 5)
+
+var float kard_prev_low = na
+var int   kard_prev_bar = na
+var int   kard_last_label = -999  // bar of last Kardashian label
+
+if not na(pivot_low) and show_kard
+    if not na(kard_prev_low)
+        tol        = pivot_low * (kard_tol / 100)
+        equal      = math.abs(pivot_low - kard_prev_low) <= tol
+        spacing    = (bar_index - kard_prev_bar) >= 4 and (bar_index - kard_prev_bar) <= 60
+        near_vwap  = not na(vwap_today) and pivot_low <= vwap_today * 1.003
+        on_cooldown= (bar_index - kard_last_label) < kard_cd
+
+        if equal and spacing and near_vwap and not on_cooldown
+            label.new(bar_index - 5, pivot_low * 0.9982,
+                 "👋 Kardashian",
+                 color=color.new(#E91E63, 10),
+                 textcolor=color.white,
+                 style=label.style_label_up,
+                 size=size.small)
+            kard_last_label := bar_index
+
+    kard_prev_low := pivot_low
+    kard_prev_bar := bar_index
+
+// ══════════════════════════════════════════════════════════
+// ANDY DEFRAIN
+// Tight coil near VWAP, with cooldown + min bars
+// ══════════════════════════════════════════════════════════
+
+var int andy_last_label = -999
+
+if show_andy and not na(vwap_today)
+    a_hi   = ta.highest(high, andy_bars)
+    a_lo   = ta.lowest(low,   andy_bars)
+    rng    = (a_hi - a_lo) / close * 100
+    near   = math.abs(close - vwap_today) / close * 100 < 0.4
+    on_cd  = (bar_index - andy_last_label) < andy_cd
+
+    if rng < andy_pct and near and not on_cd and in_session
+        label.new(bar_index, a_lo * 0.9983,
+             "🔄 Andy Defrain",
+             color=color.new(#7B1FA2, 20),
+             textcolor=color.white,
+             style=label.style_label_up,
+             size=size.small)
+        andy_last_label := bar_index
+
+// ══════════════════════════════════════════════════════════
+// SESSION SHADING
+// ══════════════════════════════════════════════════════════
+
+is_prime = (hour == 9 and minute >= 35) or hour == 10 or (hour == 11 and minute <= 30)
+is_dead  = (hour == 11 and minute > 30) or hour == 12
+
+bgcolor(is_prime and ls != 2 and ss != 2 ? color.new(#00C853, 97) : na, title="Prime Time")
+bgcolor(is_dead ? color.new(#FFD600, 97) : na, title="Dead Zone")
+
+// ══════════════════════════════════════════════════════════
+// INFO TABLE
+// ══════════════════════════════════════════════════════════
+
+var table tb = table.new(position.top_right, 2, 10,
+     bgcolor=color.new(#0D0D0D, 55),
+     border_color=color.new(#333333, 0), border_width=1,
+     frame_color=color.new(#444444, 0),  frame_width=1)
+
+ff(float v) => not na(v) ? str.tostring(math.round(v, 2)) : "—"
+
+if barstate.islast
+    table.cell(tb, 0, 0, "FO' SHO' BRO", text_color=color.white,
+         bgcolor=color.new(#1565C0, 0), text_size=size.small)
+    table.cell(tb, 1, 0, "Value",         text_color=color.white,
+         bgcolor=color.new(#1565C0, 0), text_size=size.small)
+
+    table.cell(tb, 0, 1, "Today VWAP",    text_color=c_today, text_size=size.small)
+    table.cell(tb, 1, 1, ff(vwap_today),  text_color=c_today, text_size=size.small)
+
+    table.cell(tb, 0, 2, "Prior Day",     text_color=c_pd,    text_size=size.small)
+    table.cell(tb, 1, 2, ff(vwap_pd),     text_color=c_pd,    text_size=size.small)
+
+    table.cell(tb, 0, 3, "3-Day VWAP",   text_color=c_3d,    text_size=size.small)
+    table.cell(tb, 1, 3, ff(vwap_3day),  text_color=c_3d,    text_size=size.small)
+
+    dist_td = not na(vwap_today) ? math.round((close - vwap_today) / vwap_today * 100, 2) : na
+    dist_pd = not na(vwap_pd)    ? math.round((close - vwap_pd)    / vwap_pd    * 100, 2) : na
+
+    table.cell(tb, 0, 4, "vs Today",     text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 4,
+         not na(dist_td) ? str.tostring(dist_td) + "%" : "—",
+         text_color=not na(dist_td) ? (dist_td >= 0 ? color.new(#00C853, 0) : color.new(#D50000, 0)) : color.gray,
+         text_size=size.small)
+
+    table.cell(tb, 0, 5, "vs PD VWAP",  text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 5,
+         not na(dist_pd) ? str.tostring(dist_pd) + "%" : "—",
+         text_color=not na(dist_pd) ? (dist_pd >= 0 ? color.new(#00C853, 0) : color.new(#D50000, 0)) : color.gray,
+         text_size=size.small)
+
+    ls_txt  = ls == 0 ? "Idle"     : ls == 1 ? "Flushing" : ls == 2 ? "⚡ ARMED" : "Cooldown (" + str.tostring(long_cd) + ")"
+    ss_txt  = ss == 0 ? "Idle"     : ss == 1 ? "Spiking"  : ss == 2 ? "⚡ ARMED" : "Cooldown (" + str.tostring(short_cd) + ")"
+    ls_col  = ls == 2 ? color.new(#FFD600, 0) : ls == 3 ? color.new(#555555, 0) : color.gray
+    ss_col  = ss == 2 ? color.new(#FFD600, 0) : ss == 3 ? color.new(#555555, 0) : color.gray
+
+    table.cell(tb, 0, 6, "Long State",  text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 6, ls_txt,        text_color=ls_col,     text_size=size.small)
+
+    table.cell(tb, 0, 7, "Short State", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 7, ss_txt,        text_color=ss_col,     text_size=size.small)
+
+    table.cell(tb, 0, 8, "Signals L/S", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 8, str.tostring(long_count) + " / " + str.tostring(short_count),
+         text_color=color.gray, text_size=size.small)
+
+    sig_txt = fosho_long  ? "▲ LONG"    : fosho_short ? "▼ SHORT"   : "— Waiting —"
+    sig_col = fosho_long  ? color.new(#00C853, 0) : fosho_short ? color.new(#D50000, 0) : color.gray
+    table.cell(tb, 0, 9, "Signal",      text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 9, sig_txt,       text_color=sig_col,    text_size=size.small)
+
+// ══════════════════════════════════════════════════════════
+// PLOTSHAPE (screener output)
+// ══════════════════════════════════════════════════════════
+
+plotshape(fosho_long  and show_signals, "FSB Long",
+     shape.triangleup,   location.belowbar, c_long,  size=size.small)
+plotshape(fosho_short and show_signals, "FSB Short",
+     shape.triangledown, location.abovebar, c_short, size=size.small)
+
+// ══════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════
+
+alertcondition(ls == 2,
+     "FSB: ARMED (Long)",
+     "⚡ FSB ARMED | {{ticker}} @ {{close}} | Flush confirmed. Watching for VWAP reclaim.")
+
+alertcondition(fosho_long,
+     "FSB: LONG Signal",
+     "🟢 FSB LONG | {{ticker}} @ {{close}} | Crossed back above VWAP. T1 = Prior Day VWAP.")
+
+alertcondition(fosho_short,
+     "FSB: SHORT Signal",
+     "🔴 FSB SHORT | {{ticker}} @ {{close}} | Crossed back below VWAP. T1 = Prior Day VWAP.")
+
+alertcondition(fosho_long and not na(vwap_pd) and close >= vwap_pd * 0.9995,
+     "FSB: T1 HIT",
+     "🎯 T1 HIT | {{ticker}} @ {{close}} | Prior Day VWAP reached. Scale out!")

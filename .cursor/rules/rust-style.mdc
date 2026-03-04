@@ -1,0 +1,13 @@
+---
+description: Rust coding standards
+globs: ["*.rs"]
+---
+
+# Rust Rules
+- Edition 2021
+- Result<T, String> for Tauri IPC commands
+- Derive Clone, Debug on public structs
+- serde Serialize/Deserialize on IPC types
+- rayon::par_iter for parallel sweeps
+- Avoid unwrap(), use ? operator
+- Pine modules in src/pine/ submodule

@@ -1,0 +1,396 @@
+//@version=5
+strategy("Larry Williams Combined System",
+     shorttitle="LW Combined",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.045,
+     slippage=2,
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     pyramiding=0,
+     max_bars_back=5000)
+
+// ══════════════════════════════════════════════════════════════
+// DIRECTION
+// ══════════════════════════════════════════════════════════════
+grpDir = "Direction"
+directionInput = input.string("Both", "Trade Direction", 
+     options=["Long Only", "Short Only", "Both"], group=grpDir)
+
+allowLong  = directionInput == "Both" or directionInput == "Long Only"
+allowShort = directionInput == "Both" or directionInput == "Short Only"
+
+// ══════════════════════════════════════════════════════════════
+// PATTERN TOGGLES  (Combined mode with isolation)
+// ══════════════════════════════════════════════════════════════
+grpPat = "Entry Patterns"
+useSwingStructure   = input.bool(true,  "Swing Structure (ST Low/High)", group=grpPat)
+useConsecDown       = input.bool(true,  "Consecutive Bearish Closes → Buy", group=grpPat)
+usePullback         = input.bool(true,  "Pullback in Uptrend → Buy", group=grpPat)
+useOutsideBar       = input.bool(true,  "Outside Bar Down Close → Buy", group=grpPat)
+useSmashDay         = input.bool(true,  "Smash Day Reversals", group=grpPat)
+useFadeThreeUp      = input.bool(true,  "Fade 3 Up Closes → Sell", group=grpPat)
+requireAtLeastOne   = input.bool(true,  "Require at least 1 pattern (false = pure volatility breakout)", group=grpPat)
+
+// ══════════════════════════════════════════════════════════════
+// PATTERN PARAMETERS
+// ══════════════════════════════════════════════════════════════
+grpPatP = "Pattern Parameters"
+consecBearBars   = input.int(3, "Consecutive Bearish Bars", minval=1, maxval=10, group=grpPatP)
+consecBullBars   = input.int(3, "Consecutive Bullish Bars (Fade)", minval=1, maxval=10, group=grpPatP)
+trendLookback    = input.int(30, "Uptrend Lookback Bars", minval=5, maxval=100, group=grpPatP)
+pullbackLookback = input.int(9, "Pullback Lookback Bars", minval=1, maxval=50, group=grpPatP)
+smashLookback    = input.int(1, "Smash Day Lookback Bars", minval=1, maxval=10, group=grpPatP)
+
+// ══════════════════════════════════════════════════════════════
+// VOLATILITY MODEL
+// ══════════════════════════════════════════════════════════════
+grpVol = "Volatility Breakout"
+volModel = input.string("Simple Previous Range", "Volatility Model",
+     options=["Simple Previous Range", "Swing-Based Range"], group=grpVol)
+buyMult  = input.float(0.50, "Buy Range Multiplier", step=0.05, minval=0.0, group=grpVol)
+sellMult = input.float(0.50, "Sell Range Multiplier", step=0.05, minval=0.0, group=grpVol)
+
+// ══════════════════════════════════════════════════════════════
+// STOP LOSS
+// ══════════════════════════════════════════════════════════════
+grpSL = "Stop Loss"
+stopMode     = input.string("Range Percent", "Stop Mode",
+     options=["Range Percent", "Swing Extreme"], group=grpSL)
+stopMult     = input.float(0.50, "Stop Range Multiplier", step=0.05, minval=0.0, group=grpSL)
+
+// ══════════════════════════════════════════════════════════════
+// TAKE PROFIT / EXIT
+// ══════════════════════════════════════════════════════════════
+grpTP = "Exit Mode"
+exitMode     = input.string("Risk Reward", "Exit Mode",
+     options=["Risk Reward", "First Profitable Open", "After N Bars"], group=grpTP)
+rewardRatio  = input.float(3.0, "Risk:Reward Ratio", step=0.5, minval=0.5, group=grpTP)
+exitAfterN   = input.int(3, "Exit After N Bars", minval=1, maxval=50, group=grpTP)
+
+// ══════════════════════════════════════════════════════════════
+// TDW FILTER
+// ══════════════════════════════════════════════════════════════
+grpTDW = "Trade Day of Week"
+useTDW      = input.bool(false, "Enable TDW Filter", group=grpTDW)
+tradeSun    = input.bool(false, "Sunday", group=grpTDW)
+tradeMon    = input.bool(true,  "Monday", group=grpTDW)
+tradeTue    = input.bool(false, "Tuesday", group=grpTDW)
+tradeWed    = input.bool(false, "Wednesday", group=grpTDW)
+tradeThu    = input.bool(false, "Thursday", group=grpTDW)
+tradeFri    = input.bool(false, "Friday", group=grpTDW)
+tradeSat    = input.bool(false, "Saturday", group=grpTDW)
+
+// ══════════════════════════════════════════════════════════════
+// TIME OF DAY FILTER
+// ══════════════════════════════════════════════════════════════
+grpTime = "Time of Day Filter"
+useTimeFilter = input.bool(false, "Enable Time Filter", group=grpTime)
+startHour     = input.int(9, "Start Hour", minval=0, maxval=23, group=grpTime)
+startMin      = input.int(30, "Start Minute", minval=0, maxval=59, group=grpTime)
+endHour       = input.int(16, "End Hour", minval=0, maxval=23, group=grpTime)
+endMin        = input.int(0, "End Minute", minval=0, maxval=59, group=grpTime)
+
+// ══════════════════════════════════════════════════════════════
+// VISUAL
+// ══════════════════════════════════════════════════════════════
+grpVis = "Visual"
+showLevels   = input.bool(true, "Show Entry/SL/TP Levels", group=grpVis)
+showPatterns = input.bool(true, "Show Pattern Labels", group=grpVis)
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════
+
+// ── Volatility Range ─────────────────────────────────────────
+f_simpleRange() =>
+    high[1] - low[1]
+
+f_swingRange() =>
+    // MQ5: high[4], low[1], high[2], low[4]  (bar 0 = current)
+    swingA = math.abs(high[4] - low[1])
+    swingB = math.abs(high[2] - low[4])
+    math.max(swingA, swingB)
+
+workingRange = volModel == "Simple Previous Range" ? f_simpleRange() : f_swingRange()
+
+
+// ── Short-Term Swing Detection (3-bar, from MQ5) ────────────
+// Bar indices: 1=most recent completed, 2=middle, 3=oldest
+// Matches IsLarryWilliamsShortTermLow/High exactly
+
+f_isSTLow() =>
+    // Swing low: bar[2] lower than both neighbors
+    isSwing = low[2] < low[1] and low[2] < low[3]
+    // Bar[2] NOT an outside bar relative to bar[3]
+    isOutside = high[2] > high[3] and low[2] < low[3]
+    // Bar[1] NOT an inside bar relative to bar[2]
+    isInside = high[1] < high[2] and low[1] > low[2]
+    isSwing and not isOutside and not isInside
+
+f_isSTHigh() =>
+    isSwing = high[2] > high[1] and high[2] > high[3]
+    isOutside = high[2] > high[3] and low[2] < low[3]
+    isInside = high[1] < high[2] and low[1] > low[2]
+    isSwing and not isOutside and not isInside
+
+
+// ── Consecutive Close Direction ──────────────────────────────
+// MQ5: IsConsecutiveBarCloseState - checks bars 1 to N
+f_consecDown(int n) =>
+    result = true
+    for i = 1 to n
+        if close[i] >= open[i]
+            result := false
+            break
+    result
+
+f_consecUp(int n) =>
+    result = true
+    for i = 1 to n
+        if close[i] <= open[i]
+            result := false
+            break
+    result
+
+
+// ── Pullback in Uptrend ──────────────────────────────────────
+// MQ5: IsUptrendWithPullback - uses bar[1]'s open
+f_pullbackInUptrend() =>
+    todayOpen       = open[1]
+    closeTrendBar   = close[1 + trendLookback]
+    closePullbackBar = close[1 + pullbackLookback]
+    todayOpen > closeTrendBar and todayOpen < closePullbackBar
+
+
+// ── Outside Bar with Down Close ──────────────────────────────
+// MQ5: IsOutsideBarWithDownClose - 3 conditions
+f_outsideBarDownClose() =>
+    isOutside  = high[1] > high[2] and low[1] < low[2]
+    isDownClose = close[1] < low[2]
+    isBearish   = open[1] > close[1]
+    isOutside and isDownClose and isBearish
+
+
+// ── Smash Day Reversals ──────────────────────────────────────
+// MQ5: IsSmashDayBuyReversal / IsSmashDaySellReversal
+f_isOutsideBar(int idx) =>
+    high[idx] > high[idx + 1] and low[idx] < low[idx + 1]
+
+f_smashDayBuy() =>
+    // Bar[1] must NOT be outside bar
+    if f_isOutsideBar(1)
+        false
+    else
+        // Close[1] must be below lows of bars 2..lookback+1
+        allBelow = true
+        for i = 2 to smashLookback + 1
+            if close[1] >= low[i]
+                allBelow := false
+                break
+        allBelow
+
+f_smashDaySell() =>
+    if f_isOutsideBar(1)
+        false
+    else
+        allAbove = true
+        for i = 2 to smashLookback + 1
+            if close[1] <= high[i]
+                allAbove := false
+                break
+        allAbove
+
+
+// ── TDW Filter ───────────────────────────────────────────────
+f_tdwAllowed() =>
+    if not useTDW
+        true
+    else
+        dow = dayofweek
+        switch dow
+            1 => tradeSun
+            2 => tradeMon
+            3 => tradeTue
+            4 => tradeWed
+            5 => tradeThu
+            6 => tradeFri
+            7 => tradeSat
+            => false
+
+
+// ── Time of Day Filter ───────────────────────────────────────
+f_timeAllowed() =>
+    if not useTimeFilter
+        true
+    else
+        h = hour
+        m = minute
+        currentMins = h * 60 + m
+        startMins   = startHour * 60 + startMin
+        endMins     = endHour * 60 + endMin
+        currentMins >= startMins and currentMins <= endMins
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  SIGNAL DETECTION
+// ══════════════════════════════════════════════════════════════════════
+
+// Detect patterns on last completed bar
+patSTLow            = useSwingStructure and f_isSTLow()
+patSTHigh           = useSwingStructure and f_isSTHigh()
+patConsecDown       = useConsecDown     and f_consecDown(consecBearBars)
+patPullback         = usePullback       and f_pullbackInUptrend()
+patOutsideBar       = useOutsideBar     and f_outsideBarDownClose()
+patSmashBuy         = useSmashDay       and f_smashDayBuy()
+patSmashSell        = useSmashDay       and f_smashDaySell()
+patConsecUp         = useFadeThreeUp    and f_consecUp(consecBullBars)
+
+// Any bullish pattern fired?
+anyBullish = patSTLow or patConsecDown or patPullback or patOutsideBar or patSmashBuy
+// Any bearish pattern fired?
+anyBearish = patSTHigh or patConsecUp or patSmashSell
+
+// If requireAtLeastOne is false, always allow (pure volatility breakout mode)
+longPatternOK  = requireAtLeastOne ? anyBullish : true
+shortPatternOK = requireAtLeastOne ? anyBearish : true
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  CALCULATE LEVELS
+// ══════════════════════════════════════════════════════════════════════
+
+todayOpen = open
+
+// Entry levels
+buyEntry  = todayOpen + (workingRange * buyMult)
+sellEntry = todayOpen - (workingRange * sellMult)
+
+// Stop loss
+var float bullStop = na
+var float bearStop = na
+
+if stopMode == "Range Percent"
+    bullStop := buyEntry - (workingRange * stopMult)
+    bearStop := sellEntry + (workingRange * stopMult)
+else  // Swing Extreme
+    bullStop := low[2]   // MQ5: iLow(symbol, tf, 2)
+    bearStop := high[2]  // MQ5: iHigh(symbol, tf, 2)
+
+// Smash day overrides stop to bar extreme
+smashBullStop = low[1]   // smash bar's low
+smashBearStop = high[1]  // smash bar's high
+
+// Effective stops
+effBullStop = patSmashBuy  and not patSTLow ? smashBullStop : bullStop
+effBearStop = patSmashSell and not patSTHigh ? smashBearStop : bearStop
+
+// Take profit (R:R)
+bullRisk = math.max(buyEntry  - effBullStop, workingRange * 0.001)
+bearRisk = math.max(effBearStop - sellEntry, workingRange * 0.001)
+bullTP   = buyEntry  + (bullRisk * rewardRatio)
+bearTP   = sellEntry - (bearRisk * rewardRatio)
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  FILTERS
+// ══════════════════════════════════════════════════════════════════════
+
+filtersOK = f_tdwAllowed() and f_timeAllowed()
+noPosition = strategy.position_size == 0
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  BREAKOUT ENTRY (bar-based for strategy backtesting)
+// ══════════════════════════════════════════════════════════════════════
+
+longCondition  = longPatternOK and allowLong  and filtersOK and noPosition and workingRange > 0
+shortCondition = shortPatternOK and allowShort and filtersOK and noPosition and workingRange > 0
+
+// Long entry: price crosses above buy entry level
+longTrigger  = longCondition  and close > buyEntry
+// Short entry: price crosses below sell entry level
+shortTrigger = shortCondition and close < sellEntry
+
+if longTrigger
+    if exitMode == "Risk Reward"
+        strategy.entry("LW Long", strategy.long)
+        strategy.exit("LW Long TP/SL", "LW Long", stop=effBullStop, limit=bullTP)
+    else
+        strategy.entry("LW Long", strategy.long)
+        strategy.exit("LW Long SL", "LW Long", stop=effBullStop)
+
+if shortTrigger
+    if exitMode == "Risk Reward"
+        strategy.entry("LW Short", strategy.short)
+        strategy.exit("LW Short TP/SL", "LW Short", stop=effBearStop, limit=bearTP)
+    else
+        strategy.entry("LW Short", strategy.short)
+        strategy.exit("LW Short SL", "LW Short", stop=effBearStop)
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  NON-R:R EXIT MODES
+// ══════════════════════════════════════════════════════════════════════
+
+// Track bars since entry
+var int barsSinceEntry = 0
+if strategy.position_size != 0
+    barsSinceEntry += 1
+else
+    barsSinceEntry := 0
+
+// First Profitable Open
+if exitMode == "First Profitable Open" and strategy.position_size != 0 and barsSinceEntry >= 1
+    if strategy.position_size > 0 and open > strategy.position_avg_price
+        strategy.close("LW Long", comment="FPO")
+    if strategy.position_size < 0 and open < strategy.position_avg_price
+        strategy.close("LW Short", comment="FPO")
+
+// After N Bars (MQ5: barsSinceEntry > exitAfterCandles, strictly greater)
+if exitMode == "After N Bars" and strategy.position_size != 0
+    if barsSinceEntry > exitAfterN
+        strategy.close_all(comment="N-Bar Exit")
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  VISUAL: LEVELS & PATTERN LABELS
+// ══════════════════════════════════════════════════════════════════════
+
+// Entry levels
+plot(showLevels and workingRange > 0 ? buyEntry  : na, "Buy Entry",  color=color.new(color.green, 60), style=plot.style_circles, linewidth=1)
+plot(showLevels and workingRange > 0 ? sellEntry : na, "Sell Entry", color=color.new(color.red, 60),   style=plot.style_circles, linewidth=1)
+
+// Stop levels
+plot(showLevels and workingRange > 0 ? effBullStop : na, "Bull Stop", color=color.new(color.orange, 70), style=plot.style_cross, linewidth=1)
+plot(showLevels and workingRange > 0 ? effBearStop : na, "Bear Stop", color=color.new(color.orange, 70), style=plot.style_cross, linewidth=1)
+
+// TP levels (only in R:R mode)
+plot(showLevels and exitMode == "Risk Reward" and workingRange > 0 ? bullTP : na, "Bull TP", color=color.new(color.teal, 70), style=plot.style_cross, linewidth=1)
+plot(showLevels and exitMode == "Risk Reward" and workingRange > 0 ? bearTP : na, "Bear TP", color=color.new(color.teal, 70), style=plot.style_cross, linewidth=1)
+
+// Pattern labels
+if showPatterns and patSTLow
+    label.new(bar_index[2], low[2], "ST↓", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+if showPatterns and patSTHigh
+    label.new(bar_index[2], high[2], "ST↑", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+if showPatterns and patConsecDown
+    label.new(bar_index, low, str.tostring(consecBearBars) + "D", style=label.style_label_up, color=color.blue, textcolor=color.white, size=size.tiny)
+if showPatterns and patPullback
+    label.new(bar_index, low, "PB", style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.tiny)
+if showPatterns and patOutsideBar
+    label.new(bar_index[1], low[1], "OB↓", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.tiny)
+if showPatterns and patSmashBuy
+    label.new(bar_index[1], low[1], "SM↑", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.tiny)
+if showPatterns and patSmashSell
+    label.new(bar_index[1], high[1], "SM↓", style=label.style_label_down, color=color.maroon, textcolor=color.white, size=size.tiny)
+if showPatterns and patConsecUp
+    label.new(bar_index, high, str.tostring(consecBullBars) + "U", style=label.style_label_down, color=color.fuchsia, textcolor=color.white, size=size.tiny)
+
+// Background on entry
+bgcolor(longTrigger ? color.new(color.green, 90) : na)
+bgcolor(shortTrigger ? color.new(color.red, 90) : na)

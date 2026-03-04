@@ -1,0 +1,14 @@
+---
+description: Python coding standards
+globs: ["*.py"]
+---
+
+# Python Rules
+- Type hints on all function parameters and return values
+- Import order: stdlib → third-party → local
+- Google-style docstrings on all public functions
+- numpy arrays preferred over lists for numerical data
+- f-strings over .format()
+- pathlib.Path over os.path
+- Strategy classes inherit from Strategy base class
+- Parameters declared via Param() in class-level params dict

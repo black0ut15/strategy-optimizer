@@ -1,0 +1,50 @@
+name: Sync Commits to Notion
+on:
+  push:
+    branches: [main, dev]
+
+jobs:
+  sync-to-notion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: Get changed files count
+        id: changes
+        run: |
+          COUNT=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | wc -l || echo "0")
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+      - name: Sync commit to Notion
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DEV_LOG_DB_ID: ${{ secrets.NOTION_DEV_LOG_DB_ID }}
+        run: |
+          python3 << 'PYEOF'
+          import os, requests
+          api_key = os.environ.get("NOTION_API_KEY")
+          db_id = os.environ.get("NOTION_DEV_LOG_DB_ID")
+          if not api_key or not db_id:
+              print("Notion credentials not configured, skipping")
+              exit(0)
+          headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
+          sha = "${{ github.sha }}"[:12]
+          message = """${{ github.event.head_commit.message }}""".split("\n")[0][:2000]
+          payload = {
+              "parent": {"database_id": db_id},
+              "properties": {
+                  "Name": {"title": [{"text": {"content": message}}]},
+                  "Commit SHA": {"rich_text": [{"text": {"content": sha}}]},
+                  "Branch": {"select": {"name": "${{ github.ref_name }}"}},
+                  "Date": {"date": {"start": "${{ github.event.head_commit.timestamp }}"}},
+                  "Author": {"rich_text": [{"text": {"content": "${{ github.event.head_commit.author.name }}"}}]},
+                  "Files Changed": {"number": int("${{ steps.changes.outputs.count }}" or "0")},
+              }
+          }
+          resp = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload)
+          print(f"{'Synced' if resp.status_code == 200 else 'Failed'}: {message}")
+          PYEOF

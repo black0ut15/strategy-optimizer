@@ -1,0 +1,42 @@
+---
+description: Core rules for Strategy Optimizer
+alwaysApply: true
+---
+
+# Strategy Optimizer — Cursor Rules
+
+## Project Context
+Desktop application for optimizing TradingView Pine Script and Python trading strategies.
+Users upload a strategy file (.pine or .py), configure parameter sweep ranges, and run
+distributed parallel optimization across local network machines. Users can drill into any
+result to see the full trade list and equity curve.
+
+## Architecture
+- Two Input Paths: Pine Script (.pine) gets translated to Python; Python (.py) runs directly
+- Both paths feed into the same Python backtester engine
+- Tauri (Rust) handles UI, file system, subprocess calls, distributed coordination
+- Python handles backtesting, indicators, data fetching
+
+## Stack
+- Frontend: React 18 + Tailwind CSS (Tauri webview)
+- Desktop Shell: Tauri v2 (Rust)
+- Backtester: Python (numpy)
+- Pine Translator: Rust (tokenizer → parser → AST → Python emitter)
+- Data Fetchers: Python (crypto/futures/stocks)
+- Distributed Sweep: Rust coordinator → workers via TCP
+
+## Key Directories
+- src/ — React frontend
+- src-tauri/src/ — Rust backend
+- src-tauri/src/pine/ — Pine Script translator
+- src-tauri/python/ — Python backtester engine
+- src-tauri/fetchers/ — Python data fetcher scripts
+- strategies/ — User strategy files
+
+## Important Lessons
+- Windows file permissions fail in Program Files — use AppData
+- Tauri shell plugin needs explicit scope in tauri.conf.json
+- Pine input.float(10.0)/100 compiles differently than input.float(0.10)
+- Binance spot vs futures APIs return different timestamps
+- localStorage essential for UI state persistence across tab switches
+- Create .env from PowerShell Set-Content, not from Cursor editor
