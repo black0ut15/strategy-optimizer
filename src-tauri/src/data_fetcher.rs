@@ -82,6 +82,7 @@ pub async fn fetch_crypto(
             .arg(&source_owned)
             .arg("export")
             .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONIOENCODING", "utf-8")
             .output()
     })
     .await
@@ -99,14 +100,20 @@ pub async fn fetch_crypto(
     let data_dir = get_data_dir("crypto");
     let csv_path = data_dir.join(format!("{}_{}_{}d_bt.csv", symbol, interval, days));
 
-    // Also check in the script's working directory
+    // Also check in the script's working directory (Python writes here)
     let alt_path = PathBuf::from(format!("data/crypto/{}_{}_{}d_bt.csv", symbol, interval, days));
 
-    let final_path = if csv_path.exists() {
-        csv_path
-    } else if alt_path.exists() {
-        // Move to our data dir
+    // Also check relative to src-tauri (common when running in dev mode)
+    let src_tauri_path = PathBuf::from(format!("src-tauri/data/crypto/{}_{}_{}d_bt.csv", symbol, interval, days));
+
+    // Prefer the freshly written file from the script, copy to our data dir
+    let final_path = if alt_path.exists() {
         std::fs::copy(&alt_path, &csv_path).ok();
+        csv_path.clone()
+    } else if src_tauri_path.exists() {
+        std::fs::copy(&src_tauri_path, &csv_path).ok();
+        csv_path.clone()
+    } else if csv_path.exists() {
         csv_path
     } else {
         // Try to find it from stdout
@@ -143,6 +150,7 @@ pub async fn fetch_futures(
             .arg("export")
             .env("RAPIDAPI_KEY", &api_key_owned)
             .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONIOENCODING", "utf-8")
             .output()
     })
     .await
@@ -159,11 +167,15 @@ pub async fn fetch_futures(
     let data_dir = get_data_dir("futures");
     let csv_path = data_dir.join(format!("{}_{}_{}d_bt.csv", symbol, interval, days));
     let alt_path = PathBuf::from(format!("data/futures/{}_{}_{}d_bt.csv", symbol, interval, days));
+    let src_tauri_path = PathBuf::from(format!("src-tauri/data/futures/{}_{}_{}d_bt.csv", symbol, interval, days));
 
-    let final_path = if csv_path.exists() {
-        csv_path
-    } else if alt_path.exists() {
+    let final_path = if alt_path.exists() {
         std::fs::copy(&alt_path, &csv_path).ok();
+        csv_path.clone()
+    } else if src_tauri_path.exists() {
+        std::fs::copy(&src_tauri_path, &csv_path).ok();
+        csv_path.clone()
+    } else if csv_path.exists() {
         csv_path
     } else {
         find_csv_from_output(&stdout, symbol, interval, days)?
@@ -202,6 +214,7 @@ pub async fn fetch_stocks(
             .env("ALPACA_KEY", &api_key_owned)
             .env("ALPACA_SECRET", &api_secret_owned)
             .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONIOENCODING", "utf-8")
             .output()
     })
     .await
@@ -218,11 +231,15 @@ pub async fn fetch_stocks(
     let data_dir = get_data_dir("stocks");
     let csv_path = data_dir.join(format!("{}_{}_{}d_bt.csv", symbol, interval, days));
     let alt_path = PathBuf::from(format!("data/stocks/{}_{}_{}d_bt.csv", symbol, interval, days));
+    let src_tauri_path = PathBuf::from(format!("src-tauri/data/stocks/{}_{}_{}d_bt.csv", symbol, interval, days));
 
-    let final_path = if csv_path.exists() {
-        csv_path
-    } else if alt_path.exists() {
+    let final_path = if alt_path.exists() {
         std::fs::copy(&alt_path, &csv_path).ok();
+        csv_path.clone()
+    } else if src_tauri_path.exists() {
+        std::fs::copy(&src_tauri_path, &csv_path).ok();
+        csv_path.clone()
+    } else if csv_path.exists() {
         csv_path
     } else {
         find_csv_from_output(&stdout, symbol, interval, days)?

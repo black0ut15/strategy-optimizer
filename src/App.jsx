@@ -24,6 +24,8 @@ export default function App() {
   const [tab, setTab] = useState(0);
   const [dataInfo, setDataInfo] = useState(null);
   const [sweepResults, setSweepResults] = useState(() => loadState("sweepResults", null));
+  const [lastSweepStrategy, setLastSweepStrategy] = useState(() => loadState("lastSweepStrategy", ""));
+  const [lastSweepSettings, setLastSweepSettings] = useState(() => loadState("lastSweepSettings", {}));
   const [progress, setProgress] = useState(0);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("");
@@ -67,6 +69,8 @@ export default function App() {
   useEffect(() => { saveState("workers", workers.map(w => ({ address: w.address, name: w.name }))); }, [workers]);
   useEffect(() => { saveState("pineCode", pineCode); }, [pineCode]);
   useEffect(() => { if (sweepResults) saveState("sweepResults", sweepResults); }, [sweepResults]);
+  useEffect(() => { if (lastSweepStrategy) saveState("lastSweepStrategy", lastSweepStrategy); }, [lastSweepStrategy]);
+  useEffect(() => { saveState("lastSweepSettings", lastSweepSettings); }, [lastSweepSettings]);
   useEffect(() => { if (dataInfo?.file_path) { setLastDataPath(dataInfo.file_path); saveState("lastDataPath", dataInfo.file_path); } }, [dataInfo]);
 
   // Format seconds into human readable
@@ -176,6 +180,13 @@ export default function App() {
         const nodeCount = activeWorkers.length + 1;
         setStatus(`Distributing sweep across ${nodeCount} nodes...`);
 
+        // Reset all workers before starting new sweep
+        for (const w of activeWorkers) {
+          try {
+            await invoke("reset_worker", { address: w.address });
+          } catch { /* skip if unreachable */ }
+        }
+
         // Send data to all workers
         for (const w of activeWorkers) {
           setStatus(`Sending data to ${w.name}...`);
@@ -189,12 +200,25 @@ export default function App() {
           }
         }
 
+        // Send strategy to all workers
+        const strategyName = JSON.parse(configJson).strategy || lastSweepStrategy;
+        if (strategyName) {
+          for (const w of activeWorkers.filter(w => w.status !== "error")) {
+            try {
+              await invoke("send_strategy_to_worker", { address: w.address, strategy: strategyName });
+            } catch (e) {
+              console.error(`Failed to send strategy to ${w.name}:`, e);
+            }
+          }
+        }
+
         // Estimate total combos from config structure (flat parameter map)
+        // Use floor to match Python's np.arange (exclusive stop)
         let totalCombos = 1;
         for (const vals of Object.values(config.parameters || {})) {
           if (Array.isArray(vals)) {
             if (vals.length === 3 && typeof vals[0] === "number" && typeof vals[2] === "number" && vals[2] > 0) {
-              totalCombos *= Math.max(1, Math.ceil((vals[1] - vals[0]) / vals[2]) + 1);
+              totalCombos *= Math.max(1, Math.floor((vals[1] - vals[0]) / vals[2]) + 1);
             } else {
               totalCombos *= Math.max(1, vals.length);
             }
@@ -214,11 +238,15 @@ export default function App() {
         }
         const totalWeight = weights.reduce((a, b) => a + b, 0);
 
-        // Assign combo ranges proportional to weight
+        // Assign combo ranges proportional to weight, minimum 1 per node
+        const pineNodeCount = weights.length;
+        const pineMinPerNode = Math.min(1, Math.floor(totalCombos / pineNodeCount));
+        const pineDistributable = totalCombos - pineMinPerNode * pineNodeCount;
+
         let cursor = 0;
         const chunks = [];
         for (let i = 0; i < weights.length; i++) {
-          const share = Math.round(totalCombos * (weights[i] / totalWeight));
+          const share = pineMinPerNode + Math.round(pineDistributable * (weights[i] / totalWeight));
           const chunkStart = cursor;
           const chunkEnd = Math.min(cursor + share, totalCombos);
           chunks.push({ start: chunkStart, end: chunkEnd });
@@ -333,22 +361,307 @@ export default function App() {
         setSweepResults(allResults);
         setTab(2);
 
-        // Save benchmarked speeds for next time (combos/sec per node)
+        // Save benchmarked speeds using individual elapsed times
         const elapsedSec = (Date.now() - sweepStartMs) / 1000;
         const newSpeeds = { ...loadState("workerSpeeds", {}) };
-        newSpeeds["local"] = localCombos / Math.max(1, elapsedSec);
+        if (localCombos >= 5) {
+          newSpeeds["local"] = localCombos / Math.max(1, elapsedSec);
+        }
         for (let i = 0; i < workingWorkers.length; i++) {
           const w = workingWorkers[i];
           const chunk = chunks[i + 1];
           const workerCombos = chunk.end - chunk.start;
-          newSpeeds[w.address] = workerCombos / Math.max(1, elapsedSec);
+          if (workerCombos < 5) continue;
+          try {
+            const info = await invoke("poll_worker", { address: w.address });
+            const workerElapsed = info.elapsed || elapsedSec;
+            if (workerElapsed >= 1) {
+              newSpeeds[w.address] = workerCombos / workerElapsed;
+            }
+          } catch {
+            // Don't update speed if we can't reach the worker
+          }
         }
         saveState("workerSpeeds", newSpeeds);
+        console.log("Worker speeds:", newSpeeds);
 
         setStatus(`Distributed sweep complete! ${allResults.length} results from ${nodeCount} nodes in ${formatTime(elapsedSec)}.`);
       }
     } catch (e) {
       setStatus(`Sweep error: ${e}`);
+    } finally {
+      setRunning(false);
+      setProgress(1);
+      setSweepStart(null);
+    }
+  }, [dataInfo, workers]);
+
+  // Run Python strategy sweep (local + distributed)
+  const handleRunPythonSweep = useCallback(async (strategyName, configJson) => {
+    if (!dataInfo) {
+      setStatus("Load data first!");
+      return;
+    }
+    try {
+      setRunning(true);
+      setProgress(0);
+      setSweepStart(Date.now());
+
+      const parsedConfig = JSON.parse(configJson);
+      const activeWorkers = workers.filter(w => w.status !== "error" && w.status !== "offline");
+
+      if (activeWorkers.length === 0) {
+        // ── Local-only Python sweep ──
+        setStatus(`Running Python sweep: ${strategyName}...`);
+        const unlisten = await listen("sweep-progress", (event) => {
+          setProgress(event.payload);
+        });
+
+        const resultJson = await invoke("run_python_sweep", { strategy: strategyName, configJson });
+        const output = JSON.parse(resultJson);
+        const results = output.results || [];
+
+        setSweepResults(results);
+        setLastSweepStrategy(strategyName);
+        setLastSweepSettings(parsedConfig.sweep_settings || {});
+        saveState("lastSweepStrategy", strategyName);
+        saveState("lastSweepSettings", parsedConfig.sweep_settings || {});
+        setTab(2);
+        setStatus(`Sweep complete! ${results.length} results from ${output.total_combos?.toLocaleString() || "?"} combos in ${output.elapsed || "?"}s.`);
+        unlisten();
+      } else {
+        // ── Distributed Python sweep ──
+        const nodeCount = activeWorkers.length + 1;
+        setStatus(`Distributing Python sweep across ${nodeCount} nodes...`);
+
+        // Reset all workers before starting new sweep
+        for (const w of activeWorkers) {
+          try {
+            await invoke("reset_worker", { address: w.address });
+          } catch { /* skip if unreachable */ }
+        }
+
+        // Send data to all workers
+        for (const w of activeWorkers) {
+          setStatus(`Sending data to ${w.name}...`);
+          try {
+            await invoke("send_data_to_worker", { address: w.address });
+          } catch (e) {
+            console.error(`Failed to send data to ${w.name}:`, e);
+            setWorkers(prev => prev.map(x =>
+              x.address === w.address ? { ...x, status: "error" } : x
+            ));
+          }
+        }
+
+        // Send strategy to all workers
+        for (const w of activeWorkers.filter(w => w.status !== "error")) {
+          try {
+            setStatus(`Sending strategy '${strategyName}' to ${w.name}...`);
+            const stratResp = await invoke("send_strategy_to_worker", { address: w.address, strategy: strategyName });
+            console.log(`Strategy sent to ${w.name}:`, stratResp);
+          } catch (e) {
+            setStatus(`Failed to send strategy to ${w.name}: ${e}`);
+            console.error(`Failed to send strategy to ${w.name}:`, e);
+            setWorkers(prev => prev.map(x =>
+              x.address === w.address ? { ...x, status: "error" } : x
+            ));
+          }
+        }
+
+        // Estimate total combos matching Python's np.arange (floor, exclusive stop)
+        let totalCombos = 1;
+        for (const vals of Object.values(parsedConfig.parameters || {})) {
+          if (Array.isArray(vals)) {
+            if (vals.length === 3 && typeof vals[0] === "number" && typeof vals[2] === "number" && vals[2] > 0) {
+              totalCombos *= Math.max(1, Math.floor((vals[1] - vals[0]) / vals[2]) + 1);
+            } else {
+              totalCombos *= Math.max(1, vals.length);
+            }
+          }
+        }
+
+        // Weighted chunk distribution
+        const speeds = loadState("workerSpeeds", {});
+        const workingWorkers = activeWorkers.filter(w => w.status !== "error");
+        const weights = [speeds["local"] || 1.0];
+        for (const w of workingWorkers) {
+          weights.push(speeds[w.address] || 1.0);
+        }
+        const totalWeight = weights.reduce((a, b) => a + b, 0);
+
+        // Minimum 1 combo per node, distribute rest by weight
+        const nodeCount2 = weights.length;
+        const minPerNode = Math.min(1, Math.floor(totalCombos / nodeCount2));
+        const distributable = totalCombos - minPerNode * nodeCount2;
+
+        let cursor = 0;
+        const chunks = [];
+        for (let i = 0; i < weights.length; i++) {
+          const share = minPerNode + Math.round(distributable * (weights[i] / totalWeight));
+          const chunkStart = cursor;
+          const chunkEnd = Math.min(cursor + share, totalCombos);
+          chunks.push({ start: chunkStart, end: chunkEnd });
+          cursor = chunkEnd;
+        }
+        if (chunks.length > 0) chunks[chunks.length - 1].end = totalCombos;
+
+        const localChunk = chunks[0];
+        const localCombos = localChunk.end - localChunk.start;
+        const distLog = [`Local: ${localCombos.toLocaleString()}`];
+
+        // Log detailed distribution
+        console.log("Sweep distribution:", {
+          totalCombos,
+          weights,
+          chunks: chunks.map((c, i) => ({ node: i === 0 ? "local" : workingWorkers[i-1]?.name, start: c.start, end: c.end, combos: c.end - c.start })),
+        });
+
+        // Start workers on their chunks (skip if chunk is empty due to rounding)
+        const actualWorkingWorkers = [];
+        for (let i = 0; i < workingWorkers.length; i++) {
+          const w = workingWorkers[i];
+          const chunk = chunks[i + 1];
+          const workerCombos = chunk.end - chunk.start;
+          if (workerCombos <= 0) {
+            console.warn(`Skipping ${w.name} — empty chunk [${chunk.start}, ${chunk.end}]`);
+            distLog.push(`${w.name}: skipped (0 combos)`);
+            continue;
+          }
+          distLog.push(`${w.name}: ${workerCombos.toLocaleString()}`);
+          try {
+            setStatus(`Starting sweep on ${w.name} (${workerCombos} combos)...`);
+            const sweepResp = await invoke("start_worker_sweep", {
+              address: w.address,
+              configJson,
+              chunkStart: chunk.start,
+              chunkEnd: chunk.end,
+            });
+            console.log(`Sweep started on ${w.name}:`, sweepResp);
+            setWorkers(prev => prev.map(x =>
+              x.address === w.address ? { ...x, status: "running", combos: workerCombos } : x
+            ));
+            actualWorkingWorkers.push(w);
+          } catch (e) {
+            setStatus(`Failed to start sweep on ${w.name}: ${e}`);
+            console.error(`Failed to start ${w.name}:`, e);
+          }
+        }
+
+        setStatus(`Sweeping ${nodeCount} nodes: ${distLog.join(" | ")}`);
+        const sweepStartMs = Date.now();
+
+        // Run local chunk via Python sweep (pass chunk range in config)
+        const localConfig = {
+          ...parsedConfig,
+          sweep_settings: {
+            ...(parsedConfig.sweep_settings || {}),
+            chunk_start: localChunk.start,
+            chunk_end: localChunk.end,
+          },
+        };
+        const localConfigJson = JSON.stringify(localConfig);
+
+        let localProgress = 0;
+        const unlisten = await listen("sweep-progress", (event) => {
+          localProgress = event.payload;
+        });
+
+        // Poll combined progress
+        const progressInterval = setInterval(async () => {
+          let totalProgress = localProgress;
+          let cnt = 1;
+          for (const w of actualWorkingWorkers) {
+            try {
+              const info = await invoke("poll_worker", { address: w.address });
+              setWorkers(prev => prev.map(x =>
+                x.address === w.address ? info : x
+              ));
+              totalProgress += info.progress;
+              cnt++;
+            } catch (e) { /* skip */ }
+          }
+          setProgress(totalProgress / cnt);
+        }, 2000);
+
+        const localResultJson = await invoke("run_python_sweep", { strategy: strategyName, configJson: localConfigJson });
+        const localOutput = JSON.parse(localResultJson);
+        const localResults = localOutput.results || [];
+        unlisten();
+        clearInterval(progressInterval);
+
+        // Wait for workers to finish
+        setStatus("Local done -- waiting for workers...");
+        let allDone = false;
+        while (!allDone) {
+          await new Promise(r => setTimeout(r, 2000));
+          allDone = true;
+          for (const w of actualWorkingWorkers) {
+            try {
+              const info = await invoke("poll_worker", { address: w.address });
+              setWorkers(prev => prev.map(x =>
+                x.address === w.address ? info : x
+              ));
+              if (info.status === "running") allDone = false;
+            } catch (e) { /* skip */ }
+          }
+        }
+
+        // Collect results from all workers
+        let allResults = [...localResults];
+        for (const w of actualWorkingWorkers) {
+          try {
+            const json = await invoke("get_worker_results", { address: w.address });
+            const parsed = JSON.parse(json);
+            const workerResults = parsed.results || parsed || [];
+            allResults.push(...(Array.isArray(workerResults) ? workerResults : []));
+          } catch (e) {
+            console.error(`Failed to get results from ${w.name}:`, e);
+          }
+        }
+
+        // Sort and trim
+        const sortBy = parsedConfig.sweep_settings?.sort_by || "pf";
+        allResults.sort((a, b) => (b[sortBy] ?? 0) - (a[sortBy] ?? 0));
+        const topN = parsedConfig.sweep_settings?.top_n || 200;
+        allResults = allResults.slice(0, topN);
+
+        setSweepResults(allResults);
+        setLastSweepStrategy(strategyName);
+        setLastSweepSettings(parsedConfig.sweep_settings || {});
+        saveState("lastSweepStrategy", strategyName);
+        saveState("lastSweepSettings", parsedConfig.sweep_settings || {});
+        setTab(2);
+
+        // Save benchmarked speeds using individual elapsed times
+        const localElapsed = (Date.now() - sweepStartMs) / 1000;
+        const newSpeeds = { ...loadState("workerSpeeds", {}) };
+        if (localCombos >= 5) {
+          newSpeeds["local"] = localCombos / Math.max(1, localElapsed);
+        }
+        for (let i = 0; i < workingWorkers.length; i++) {
+          const w = workingWorkers[i];
+          const chunk = chunks[i + 1];
+          const workerCombos = chunk.end - chunk.start;
+          // Only record speed for meaningful chunks (>=5 combos)
+          if (workerCombos < 5) continue;
+          try {
+            const info = await invoke("poll_worker", { address: w.address });
+            const workerElapsed = info.elapsed || localElapsed;
+            if (workerElapsed >= 1) {
+              newSpeeds[w.address] = workerCombos / workerElapsed;
+            }
+          } catch {
+            // Don't update speed if we can't reach the worker
+          }
+        }
+        saveState("workerSpeeds", newSpeeds);
+        console.log("Worker speeds:", newSpeeds);
+
+        setStatus(`Distributed sweep done! ${allResults.length} results from ${nodeCount} nodes in ${formatTime(localElapsed)}.`);
+      }
+    } catch (e) {
+      setStatus(`Python sweep error: ${e}`);
     } finally {
       setRunning(false);
       setProgress(1);
@@ -365,11 +678,19 @@ export default function App() {
         defaultPath: "sweep_results.csv",
       });
       if (!path) return;
-      // Convert results to CSV
-      const headers = Object.keys(sweepResults[0]?.params || {}).join(",") + ",pf,net,dd,wr,trades";
+      // Convert results to CSV — handle both flat (Python) and nested (Pine) formats
+      const first = sweepResults[0];
+      const paramKeys = Object.keys(first?.params || {});
+      const headers = [...paramKeys, "pf", "net", "dd_pct", "wr", "trades"].join(",");
       const rows = sweepResults.map(r => {
-        const pVals = Object.values(r.params).join(",");
-        return `${pVals},${r.result.profit_factor.toFixed(3)},${r.result.net_profit.toFixed(2)},${r.result.max_drawdown.toFixed(2)},${r.result.win_rate.toFixed(1)},${r.result.total_trades}`;
+        const pVals = paramKeys.map(k => r.params?.[k] ?? "").join(",");
+        // Flat format (Python): r.pf, r.net, etc. | Nested (Pine): r.result.profit_factor
+        const pf = r.pf ?? r.result?.profit_factor ?? 0;
+        const net = r.net ?? r.result?.net_profit ?? 0;
+        const dd = r.dd_pct ?? r.result?.max_drawdown ?? 0;
+        const wr = r.wr ?? r.result?.win_rate ?? 0;
+        const trades = r.trades ?? r.result?.total_trades ?? 0;
+        return `${pVals},${pf.toFixed(3)},${net.toFixed(2)},${dd.toFixed(1)},${wr.toFixed(1)},${trades}`;
       });
       await invoke("save_results", { path, csvData: [headers, ...rows].join("\n") });
       setStatus(`Saved ${sweepResults.length} results to ${path}`);
@@ -451,6 +772,7 @@ export default function App() {
           <div>
             <StrategyLab
               onRunSweep={handleRunSweep}
+              onRunPythonSweep={handleRunPythonSweep}
               onLoadData={handleLoadData}
               dataInfo={dataInfo}
               running={running}
@@ -473,6 +795,9 @@ export default function App() {
           <Results
             results={sweepResults}
             onSave={handleSaveResults}
+            dataInfo={dataInfo}
+            sweepStrategy={lastSweepStrategy}
+            sweepSettings={lastSweepSettings}
           />
         )}
       </div>

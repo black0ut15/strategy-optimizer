@@ -5,11 +5,11 @@ Source: Alpaca Market Data API v2 (official)
   - https://data.alpaca.markets/v2/stocks/{symbol}/bars
 
 Features:
-  - Official API — stable, well-documented
+  - Official API -- stable, well-documented
   - Requires live Alpaca brokerage account + API keys (for SIP feed)
   - 6+ years of intraday history on live account
-  - Up to 10,000 bars per request — very fast pagination
-  - SQLite caching — only fetches missing data on subsequent calls
+  - Up to 10,000 bars per request -- very fast pagination
+  - SQLite caching -- only fetches missing data on subsequent calls
   - Same interface and export format as crypto_fetcher.py
   - Backtester CSV export: Unix ms timestamps, integer volume
 
@@ -47,6 +47,7 @@ Notes:
   - Rate limit: 200 requests/min on live account
 """
 
+import os
 import time
 import sqlite3
 import requests
@@ -65,6 +66,7 @@ DB_FILE    = os.path.join("data", "stocks", "stocks_ohlcv.db")
 class OHLCVCache:
     def __init__(self, db_file=DB_FILE):
         self.db_file = db_file
+        os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
         self._init_db()
 
     def _init_db(self):

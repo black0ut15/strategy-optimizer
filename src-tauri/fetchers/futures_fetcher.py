@@ -29,10 +29,10 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "futu
 BASE_URL = "https://insightsentry.p.rapidapi.com"
 RAPIDAPI_HOST = "insightsentry.p.rapidapi.com"
 
-# Rate limiting: Ultra plan = 40 req/min → ~1.5s between requests, use 2s for safety
+# Rate limiting: Ultra plan = 40 req/min -> ~1.5s between requests, use 2s for safety
 RATE_LIMIT_DELAY = 2.0
 
-# Symbol mapping: user-friendly → (exchange_prefix, product_code)
+# Symbol mapping: user-friendly -> (exchange_prefix, product_code)
 SYMBOL_MAP = {
     # CME E-mini / Micro
     "ES":  ("CME_MINI", "ES"),    # E-mini S&P 500
@@ -121,6 +121,7 @@ def get_contracts_for_period(exchange, product, start_dt, end_dt):
 
 # ── Database ────────────────────────────────────────────────────────
 def init_db():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ohlcv (
@@ -145,7 +146,7 @@ def upsert_bars(conn, symbol, interval, bars):
         return 0
     rows = []
     for b in bars:
-        ts_ms = int(float(b["time"]) * 1000)  # unix seconds → ms
+        ts_ms = int(float(b["time"]) * 1000)  # unix seconds -> ms
         rows.append((symbol, interval, ts_ms, b["open"], b["high"], b["low"], b["close"], b["volume"]))
     conn.executemany(
         "INSERT OR REPLACE INTO ohlcv (symbol, interval, ts, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)",
@@ -260,7 +261,7 @@ def export_csv(rows, symbol, interval, days, output_dir="."):
     with open(filepath, "w") as f:
         for ts, o, h, l, c, v in rows:
             f.write(f"{ts},{o},{h},{l},{c},{v}\n")
-    print(f"\nExported {len(rows)} bars → {filepath}")
+    print(f"\nExported {len(rows)} bars -> {filepath}")
     return filepath
 
 
@@ -302,7 +303,7 @@ def main():
         sys.exit(1)
 
     print(f"═══ Futures Fetcher (InsightSentry) ═══")
-    print(f"Symbol: {symbol_key} → {exchange}:{product}")
+    print(f"Symbol: {symbol_key} -> {exchange}:{product}")
     print(f"Interval: {interval} ({bar_interval} {bar_type})")
     print(f"Period: {days} days\n")
 
@@ -319,11 +320,11 @@ def main():
         cache_start_dt = datetime.fromtimestamp(cache_min / 1000, tz=timezone.utc)
         cache_end_dt = datetime.fromtimestamp(cache_max / 1000, tz=timezone.utc)
         stale_min = (now_ts - cache_max) / 60000
-        print(f"Cache: {cache_start_dt:%Y-%m-%d %H:%M} → {cache_end_dt:%Y-%m-%d %H:%M} UTC")
+        print(f"Cache: {cache_start_dt:%Y-%m-%d %H:%M} -> {cache_end_dt:%Y-%m-%d %H:%M} UTC")
         print(f"Staleness: {stale_min:.0f} min")
 
         if cache_min <= start_ts and stale_min < 10:
-            print("Cache is fresh — skipping fetch.\n")
+            print("Cache is fresh -- skipping fetch.\n")
             need_fetch = False
         else:
             if cache_min > start_ts:
@@ -345,7 +346,7 @@ def main():
     if rows:
         first_dt = datetime.fromtimestamp(rows[0][0] / 1000, tz=timezone.utc)
         last_dt = datetime.fromtimestamp(rows[-1][0] / 1000, tz=timezone.utc)
-        print(f"Range: {first_dt:%Y-%m-%d %H:%M} → {last_dt:%Y-%m-%d %H:%M} UTC")
+        print(f"Range: {first_dt:%Y-%m-%d %H:%M} -> {last_dt:%Y-%m-%d %H:%M} UTC")
 
     if do_export and rows:
         export_csv(rows, symbol_key, interval, days, os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "futures"))

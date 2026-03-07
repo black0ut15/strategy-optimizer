@@ -154,14 +154,22 @@ class PureORB(Strategy):
         self.atr_arr = ta.atr(ctx.bars.high, ctx.bars.low, ctx.bars.close,
                               self.p.atr_length)
 
-        # Pre-compute CT times for every bar
+        # Pre-compute CT times for every bar (cached on Bars to avoid
+        # recomputing across sweep iterations)
+        if not hasattr(ctx.bars, '_ct_minutes'):
+            n = len(ctx.bars)
+            ct_minutes = np.zeros(n, dtype=int)
+            ct_dates = [''] * n
+            for i in range(n):
+                ct_min, ct_date, _ = _utc_to_ct_minutes(int(ctx.bars.timestamp[i]))
+                ct_minutes[i] = ct_min
+                ct_dates[i] = ct_date
+            ctx.bars._ct_minutes = ct_minutes
+            ctx.bars._ct_dates = ct_dates
+
         n = len(ctx.bars)
-        self.ct_minutes = np.zeros(n, dtype=int)
-        self.ct_dates = [''] * n
-        for i in range(n):
-            ct_min, ct_date, _ = _utc_to_ct_minutes(int(ctx.bars.timestamp[i]))
-            self.ct_minutes[i] = ct_min
-            self.ct_dates[i] = ct_date
+        self.ct_minutes = ctx.bars._ct_minutes
+        self.ct_dates = ctx.bars._ct_dates
 
         # Parse session windows
         self.session_start, self.session_end = _parse_session(self.p.cash_session)

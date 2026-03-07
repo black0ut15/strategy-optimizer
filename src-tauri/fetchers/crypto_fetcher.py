@@ -2,13 +2,13 @@
 Crypto OHLCV Data Fetcher
 ==========================
 Sources:
-  - Binance (primary)   — 1000 bars/request, years of history, no auth required
-  - Coinbase (fallback) — 300 bars/request, public endpoint, no auth required
+  - Binance (primary)   -- 1000 bars/request, years of history, no auth required
+  - Coinbase (fallback) -- 300 bars/request, public endpoint, no auth required
 
 Features:
   - Completely free, no API keys needed
   - Paginated fetching for full year+ of 1-min/5-min bars
-  - SQLite caching — only fetches missing data on subsequent calls
+  - SQLite caching -- only fetches missing data on subsequent calls
   - Same interface as tradestation_fetcher.py / alpaca_fetcher.py
 
 Setup:
@@ -42,6 +42,7 @@ Binance symbol format:  BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, etc.
 Coinbase symbol format: BTC-USD, ETH-USD, SOL-USD, etc.
 """
 
+import os
 import time
 import sqlite3
 import requests
@@ -64,7 +65,7 @@ RATE_LIMIT     = 0.25   # seconds between requests
 
 DB_FILE = os.path.join("data", "crypto", "crypto_ohlcv.db")
 
-# Interval in milliseconds — used for pagination
+# Interval in milliseconds -- used for pagination
 INTERVAL_MS = {
     "1m":  60_000,
     "3m":  180_000,
@@ -90,6 +91,7 @@ INTERVAL_MS = {
 class OHLCVCache:
     def __init__(self, db_file: str = DB_FILE):
         self.db_file = db_file
+        os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
         self._init_db()
 
     def _init_db(self):
@@ -168,7 +170,7 @@ class OHLCVCache:
 class CryptoFetcher:
     """
     Fetch crypto OHLCV bars from Binance (primary) or Coinbase (fallback).
-    Completely free — no API keys required.
+    Completely free -- no API keys required.
 
     Args:
         db_file:         SQLite cache path (default: crypto_ohlcv.db)
@@ -200,7 +202,7 @@ class CryptoFetcher:
             "limit":     BINANCE_LIMIT,
         }
         if self.futures_mode:
-            # Futures endpoint — no fallback needed
+            # Futures endpoint -- no fallback needed
             try:
                 resp = self._session.get(f"{self.binance_base}/klines", params=params, timeout=10)
                 if resp.status_code == 200:
@@ -234,7 +236,7 @@ class CryptoFetcher:
         current  = start_ms
         page     = 1
 
-        print(f"  Fetching {symbol} {interval} from Binance: {start.date()} → {end.date()}")
+        print(f"  Fetching {symbol} {interval} from Binance: {start.date()} -> {end.date()}")
 
         while current < end_ms:
             chunk_end = min(current + BINANCE_LIMIT * interval_ms, end_ms)
@@ -298,7 +300,7 @@ class CryptoFetcher:
         current  = start
         page     = 1
 
-        print(f"  Fetching {symbol} {granularity}s from Coinbase: {start.date()} → {end.date()}")
+        print(f"  Fetching {symbol} {granularity}s from Coinbase: {start.date()} -> {end.date()}")
 
         while current < end:
             chunk_end = min(current + window, end)
@@ -334,19 +336,19 @@ class CryptoFetcher:
         cached_start, cached_end = self.cache.get_cached_range(symbol, source, interval_key)
 
         if cached_start is not None:
-            print(f"  Cache found: {cached_start.date()} → {cached_end.date()}")
+            print(f"  Cache found: {cached_start.date()} -> {cached_end.date()}")
 
             fully_covered = (
                 cached_start <= start and
                 cached_end >= end - timedelta(minutes=5)
             )
             if fully_covered:
-                print("  Fully cached — loading from DB...")
+                print("  Fully cached -- loading from DB...")
                 return self.cache.load_bars(symbol, source, interval_key, start, end)
 
             # Fetch older gap
             if cached_start > start:
-                print(f"  Fetching older gap: {start.date()} → {cached_start.date()}")
+                print(f"  Fetching older gap: {start.date()} -> {cached_start.date()}")
                 old_df = fetch_fn(start, cached_start - timedelta(minutes=1))
                 if not old_df.empty:
                     self.cache.save_bars(symbol, source, interval_key, old_df)
@@ -355,13 +357,13 @@ class CryptoFetcher:
             # Fetch newer gap
             if cached_end < end - timedelta(minutes=5):
                 fetch_from = cached_end + timedelta(minutes=1)
-                print(f"  Fetching newer gap: {fetch_from.date()} → {end.date()}")
+                print(f"  Fetching newer gap: {fetch_from.date()} -> {end.date()}")
                 new_df = fetch_fn(fetch_from, end)
                 if not new_df.empty:
                     self.cache.save_bars(symbol, source, interval_key, new_df)
                     print(f"  Saved {len(new_df):,} newer bars.")
         else:
-            print(f"  No cache — fetching full range...")
+            print(f"  No cache -- fetching full range...")
             df = fetch_fn(start, end)
             if not df.empty:
                 self.cache.save_bars(symbol, source, interval_key, df)
@@ -376,7 +378,7 @@ class CryptoFetcher:
 
     def get_bars(self, symbol: str, interval: str = "5m",
                  days_back: int = 365, use_cache: bool = True,
-                 end: datetime = None) -> pd.DataFrame:
+                 end: datetime = None, warmup_days: int = 0) -> pd.DataFrame:
         """
         Fetch OHLCV bars from Binance. No API key required.
 
@@ -386,17 +388,22 @@ class CryptoFetcher:
             days_back: Calendar days of history
             use_cache: Use SQLite cache
             end:       End datetime (default: now)
+            warmup_days: Extra days to prepend for indicator warmup (default: 0)
 
         Returns:
             pd.DataFrame with columns: open, high, low, close, volume
         """
         symbol = symbol.upper()
         end    = self._ensure_utc(end or datetime.now(timezone.utc))
-        start  = end - timedelta(days=days_back)
+        total_days = days_back + warmup_days
+        start  = end - timedelta(days=total_days)
 
         cache_source = "binance_futures" if self.futures_mode else "binance"
         mode_label   = "Binance Futures (fapi)" if self.futures_mode else "Binance"
-        print(f"\nFetching {symbol} {interval} ({days_back} days) from {mode_label}")
+        if warmup_days > 0:
+            print(f"\nFetching {symbol} {interval} ({days_back}+{warmup_days} warmup = {total_days} days) from {mode_label}")
+        else:
+            print(f"\nFetching {symbol} {interval} ({days_back} days) from {mode_label}")
         if self.futures_mode:
             print(f"  Endpoint: {self.binance_base}/klines")
 
@@ -469,33 +476,51 @@ class CryptoFetcher:
         return results
 
     def export_backtester_csv(self, symbol: str, interval: str, days_back: int = 365,
-                              source: str = "binance", filepath: str = None) -> str:
+                              source: str = "binance", filepath: str = None,
+                              warmup_bars: int = 0) -> str:
         """
         Export OHLCV data in backtester format:
           timestamp,open,high,low,close,volume
           1706140800000,42150.5,42380.0,42050.2,42275.8,1234.56
 
         Timestamp is Unix milliseconds (integer).
-        No index column, no timezone info — clean for Rust consumption.
+        No index column, no timezone info -- clean for Rust consumption.
+
+        When warmup_bars > 0, extra bars are prepended so the backtester
+        can compute indicators before the trading window starts.
+        The returned file includes a comment header with the warmup count.
 
         Args:
             symbol:    Symbol to export
             interval:  Bar interval
-            days_back: Days of history
+            days_back: Days of history (trading window)
             source:    "binance" or "coinbase"
             filepath:  Output path (default: SYMBOL_INTERVAL_DAYSd_bt.csv)
+            warmup_bars: Extra bars to prepend for indicator warmup (default: 0)
 
         Returns:
             Path to the exported file
         """
+        # Calculate warmup_days from warmup_bars + interval
+        warmup_days = 0
+        if warmup_bars > 0:
+            interval_ms = INTERVAL_MS.get(interval, 300_000)
+            warmup_ms = warmup_bars * interval_ms
+            warmup_days = max(1, int(warmup_ms / 86_400_000) + 1)  # +1 for safety
+            print(f"  Warmup: {warmup_bars} bars = {warmup_days} extra days")
+
         fn = self.get_bars if source == "binance" else self.get_bars_coinbase
-        df = fn(symbol, interval=interval, days_back=days_back)
+        if source == "binance":
+            df = fn(symbol, interval=interval, days_back=days_back, warmup_days=warmup_days)
+        else:
+            # Coinbase doesn't have warmup_days param yet — just fetch more days
+            df = fn(symbol, interval=interval, days_back=days_back + warmup_days)
 
         if df.empty:
             print("No data to export.")
             return ""
 
-        # Convert ISO timestamp index → Unix milliseconds integer
+        # Convert ISO timestamp index -> Unix milliseconds integer
         bt = df.copy().reset_index()
         bt["timestamp"] = pd.to_datetime(bt["timestamp"], utc=True)
         bt["timestamp"] = bt["timestamp"].apply(lambda x: int(x.timestamp() * 1000)).astype("int64")
@@ -511,7 +536,13 @@ class CryptoFetcher:
         bt[["timestamp", "open", "high", "low", "close", "volume"]].to_csv(
             filepath, index=False
         )
-        print(f"Exported {len(bt):,} bars → {filepath}")
+        total_bars = len(bt)
+        actual_warmup = min(warmup_bars, total_bars)
+        trading_bars = total_bars - actual_warmup
+        print(f"Exported {total_bars:,} bars -> {filepath}")
+        if warmup_bars > 0:
+            print(f"  Warmup: first {actual_warmup} bars | Trading window: {trading_bars} bars")
+            print(f"  Pass warmup_bars={actual_warmup} to BacktestEngine to skip warmup period")
         print(f"Format: timestamp (Unix ms), open, high, low, close, volume")
         print(f"Sample row: {bt.iloc[0].to_dict()}")
         return filepath
@@ -524,7 +555,7 @@ class CryptoFetcher:
         if filepath is None:
             filepath = os.path.join("data", "crypto", f"{symbol}_{interval}_{days_back}d.csv")
         df.to_csv(filepath)
-        print(f"Exported {len(df):,} bars → {filepath}")
+        print(f"Exported {len(df):,} bars -> {filepath}")
         return filepath
 
     def export_parquet(self, symbol: str, interval: str, days_back: int = 365,
@@ -535,7 +566,7 @@ class CryptoFetcher:
         if filepath is None:
             filepath = os.path.join("data", "crypto", f"{symbol}_{interval}_{days_back}d.parquet")
         df.to_parquet(filepath)
-        print(f"Exported {len(df):,} bars → {filepath}")
+        print(f"Exported {len(df):,} bars -> {filepath}")
         return filepath
 
     def list_binance_symbols(self) -> list:
@@ -561,14 +592,14 @@ if __name__ == "__main__":
     #   python crypto_fetcher.py [symbol] [interval] [days] [source] [command]
     #
     # source options:
-    #   binance         — Binance spot (default)
-    #   futures         — Binance USDT-M futures (fapi)
-    #   coinbase        — Coinbase
+    #   binance         -- Binance spot (default)
+    #   futures         -- Binance USDT-M futures (fapi)
+    #   coinbase        -- Coinbase
     #
     # Commands:
-    #   (none)   — fetch and display summary
-    #   export   — export backtester CSV (Unix ms timestamps)
-    #   csv      — export human-readable CSV (ISO timestamps)
+    #   (none)   -- fetch and display summary
+    #   export   -- export backtester CSV (Unix ms timestamps)
+    #   csv      -- export human-readable CSV (ISO timestamps)
     #
     # Examples:
     #   python crypto_fetcher.py BTCUSDT 5m 365
@@ -604,7 +635,7 @@ if __name__ == "__main__":
             print("No data returned.")
         else:
             print(f"\nResult: {len(df):,} bars")
-            print(f"Range:  {df.index[0]} → {df.index[-1]}")
+            print(f"Range:  {df.index[0]} -> {df.index[-1]}")
             print(df.head())
             print("...")
             print(df.tail())

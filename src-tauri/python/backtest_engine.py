@@ -37,6 +37,9 @@ class Bars:
     close: np.ndarray
     volume: np.ndarray
     hl2: np.ndarray
+    hlc3: np.ndarray
+    ohlc4: np.ndarray
+    hlcc4: np.ndarray
 
     @staticmethod
     def from_csv(filepath: str) -> "Bars":
@@ -45,18 +48,39 @@ class Bars:
             filepath, delimiter=",", skip_header=1,
             dtype=float, filling_values=np.nan
         )
+        o = data[:, 1]
+        h = data[:, 2]
+        l = data[:, 3]
+        c = data[:, 4]
         return Bars(
             timestamp=data[:, 0].astype(np.int64),
-            open=data[:, 1],
-            high=data[:, 2],
-            low=data[:, 3],
-            close=data[:, 4],
+            open=o,
+            high=h,
+            low=l,
+            close=c,
             volume=data[:, 5],
-            hl2=(data[:, 2] + data[:, 3]) / 2.0,
+            hl2=(h + l) / 2.0,
+            hlc3=(h + l + c) / 3.0,
+            ohlc4=(o + h + l + c) / 4.0,
+            hlcc4=(h + l + c + c) / 4.0,
         )
 
     def __len__(self) -> int:
         return len(self.close)
+
+    def get_source(self, name: str) -> np.ndarray:
+        """Get a price source by TradingView name."""
+        sources = {
+            "close": self.close,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "hl2": self.hl2,
+            "hlc3": self.hlc3,
+            "ohlc4": self.ohlc4,
+            "hlcc4": self.hlcc4,
+        }
+        return sources.get(name, self.close)
 
 
 @dataclass
@@ -110,11 +134,16 @@ class Context:
     - Access pre-loaded bar arrays for indicator computation
     """
 
-    def __init__(self, bars: Bars, initial_capital: float, fee_pct: float, detail: bool = False):
+    def __init__(self, bars: Bars, initial_capital: float, fee_pct: float, detail: bool = False,
+                 fill_on_bar_close: bool = False, calc_on_order_fills: bool = True):
         self.bars = bars
         self.initial_capital = initial_capital
         self.fee_pct = fee_pct  # per-side fee as percentage (e.g. 0.035 = 0.035%)
         self.detail = detail
+
+        # TradingView fill/recalculation modes
+        self.fill_on_bar_close = fill_on_bar_close      # process_orders_on_close
+        self.calc_on_order_fills = calc_on_order_fills   # calc_on_order_fills
 
         # Position state
         self._direction = 0  # 0=flat, 1=long, -1=short
@@ -136,11 +165,19 @@ class Context:
 
         # Current bar
         self.bar_index = 0
+        self._last_close = 0.0  # Tracks last bar close for strategy_equity
 
-        # Pending orders (filled during _process_orders)
-        self._pending_entries: List[Tuple[str, str, float]] = []  # (id, direction, qty)
+        # Pending orders (filled during _fill_pending_orders)
+        self._pending_entries: List[Tuple[str, str, float, Any]] = []  # (id, direction, qty, qty_func)
         self._pending_close: bool = False
         self._pending_close_all: bool = False
+        self._pending_close_comment: str = ""
+
+        # Bracket exit orders (stop/limit) — set via strategy.exit()
+        # These persist until the position is closed or replaced
+        self._exit_stop: Optional[float] = None   # Stop loss price
+        self._exit_limit: Optional[float] = None   # Take profit price
+        self._exit_id: str = ""                     # Exit order name
 
         # Detail mode storage
         self._trades: List[Trade] = []
@@ -161,29 +198,77 @@ class Context:
         """Average entry price of current position."""
         return self._entry_price if self._direction != 0 else 0.0
 
-    def entry(self, id: str, direction: str, qty: float = 1.0) -> None:
-        """Queue an entry order. Filled at current bar's close."""
-        self._pending_entries.append((id, direction.lower(), qty))
+    @property
+    def strategy_equity(self) -> float:
+        """Equity including unrealized P&L — matches Pine's strategy.equity.
 
-    def close(self, id: str) -> None:
+        Pine Script's strategy.equity = realized equity + open position P&L.
+        Pine evaluates this at bar close, so we use the current bar's close.
+        """
+        if self._direction != 0:
+            # Use current bar's close for unrealized calculation
+            current_close = self.bars.close[self.bar_index]
+            return self.equity + self._unrealized_pnl(current_close)
+        return self.equity
+
+    def entry(self, id: str, direction: str, qty: float = 1.0, qty_func=None) -> None:
+        """Queue an entry order. Filled at next bar's open.
+        
+        Args:
+            qty_func: Optional callable(fill_price, equity) -> qty.
+                      If provided, qty is recalculated at fill time using
+                      post-close equity. This matches TradingView's
+                      calc_on_order_fills=true behavior for reversals.
+        """
+        self._pending_entries.append((id, direction.lower(), qty, qty_func))
+
+    def close(self, id: str, comment: str = "") -> None:
         """Queue a close order for the named position."""
         self._pending_close = True
+        self._pending_close_comment = comment
 
-    def close_all(self) -> None:
+    def close_all(self, comment: str = "") -> None:
         """Queue close of all positions."""
         self._pending_close_all = True
+        self._pending_close_comment = comment
+
+    def exit(self, id: str, from_entry: str = "",
+             stop: Optional[float] = None,
+             limit: Optional[float] = None) -> None:
+        """Set bracket exit orders (stop loss and/or take profit).
+
+        Matches Pine's strategy.exit(). These orders persist until:
+        - The position is closed (by stop, limit, or manual close)
+        - New exit() call replaces them
+        - Position is flat
+
+        Args:
+            id: Exit order identifier
+            from_entry: Entry order to attach to (informational)
+            stop: Stop loss price (exit if price goes against position)
+            limit: Take profit price (exit if price goes in favor)
+        """
+        self._exit_stop = stop
+        self._exit_limit = limit
+        self._exit_id = id
 
     def set_exit_reason(self, reason: str) -> None:
         """Set exit reason for the current bar's trade (detail mode)."""
         self._exit_reason = reason
 
     def _process_orders(self, bar: BarData) -> None:
-        """Queue orders for next-bar fill. Called by engine after on_bar.
+        """Process bracket exits and track equity at bar close.
 
         With process_orders_on_close=false (TradingView default):
-        Orders placed on bar N fill at bar N+1's open price.
-        We store pending orders and fill them at the start of the next bar.
+        Entry orders placed on bar N fill at bar N+1's open price.
+        But bracket exits (stop/limit) are checked intra-bar against high/low.
         """
+        self._last_close = bar.close
+
+        # Check bracket exit orders (stop/limit) intra-bar
+        if self._direction != 0 and (self._exit_stop is not None or self._exit_limit is not None):
+            self._check_bracket_exits(bar)
+
         # Update equity with unrealized PnL for drawdown tracking
         if self._direction != 0:
             unreal = self._unrealized_pnl(bar.close)
@@ -194,19 +279,75 @@ class Context:
             if dd > self._max_drawdown:
                 self._max_drawdown = dd
 
-    def _fill_pending_orders(self, bar: BarData) -> None:
-        """Fill queued orders at this bar's open. Called at start of each bar."""
-        fill_price = bar.open
+    def _check_bracket_exits(self, bar: BarData) -> None:
+        """Check if stop loss or take profit was hit during this bar.
+
+        TradingView fill logic for stops/limits:
+        - For longs: stop triggers if low <= stop price, limit triggers if high >= limit price
+        - For shorts: stop triggers if high >= stop price, limit triggers if low <= limit price
+        - If both could trigger on same bar, stop takes priority (conservative assumption)
+        - Fill price = the stop/limit price itself (not bar open/close)
+        """
+        stop = self._exit_stop
+        limit = self._exit_limit
+
+        stop_hit = False
+        limit_hit = False
+
+        if self._direction == 1:  # Long position
+            if stop is not None and bar.low <= stop:
+                stop_hit = True
+            if limit is not None and bar.high >= limit:
+                limit_hit = True
+        elif self._direction == -1:  # Short position
+            if stop is not None and bar.high >= stop:
+                stop_hit = True
+            if limit is not None and bar.low <= limit:
+                limit_hit = True
+
+        # Stop takes priority if both hit on same bar
+        if stop_hit:
+            self._exit_reason = "STOP"
+            self._close_position(stop, bar)
+            self._clear_bracket_exits()
+        elif limit_hit:
+            self._exit_reason = "TAKE_PROFIT"
+            self._close_position(limit, bar)
+            self._clear_bracket_exits()
+
+    def _clear_bracket_exits(self) -> None:
+        """Clear all bracket exit orders."""
+        self._exit_stop = None
+        self._exit_limit = None
+        self._exit_id = ""
+
+    def _fill_pending_orders(self, bar: BarData, prev_bar_close: float = 0.0) -> None:
+        """Fill queued orders. Called at start of each bar.
+        
+        Fill price depends on mode:
+        - fill_on_bar_close=False (default): fill at this bar's open
+        - fill_on_bar_close=True: fill at previous bar's close
+        
+        If calc_on_order_fills=True, reversal entries recalculate qty
+        using post-close equity (via qty_func if provided).
+        """
+        if self.fill_on_bar_close and prev_bar_close > 0:
+            fill_price = prev_bar_close
+        else:
+            fill_price = bar.open
 
         # 1. Process close/close_all
         if (self._pending_close or self._pending_close_all) and self._direction != 0:
+            if self._pending_close_comment:
+                self._exit_reason = self._pending_close_comment
             self._close_position(fill_price, bar)
 
         self._pending_close = False
         self._pending_close_all = False
+        self._pending_close_comment = ""
 
         # 2. Process entries
-        for entry_id, direction, qty in self._pending_entries:
+        for entry_id, direction, qty, qty_func in self._pending_entries:
             dir_int = 1 if direction == "long" else -1
 
             # Reversal: close existing first
@@ -215,6 +356,9 @@ class Context:
 
             # Open new position
             if self._direction == 0:
+                # Recalculate qty at fill time if calc_on_order_fills is enabled
+                if self.calc_on_order_fills and qty_func is not None:
+                    qty = qty_func(fill_price, self.equity)
                 self._direction = dir_int
                 self._qty = qty
                 self._entry_price = fill_price
@@ -282,6 +426,7 @@ class Context:
         self._qty = 0.0
         self._entry_price = 0.0
         self._entry_bar = 0
+        self._clear_bracket_exits()
 
     def _unrealized_pnl(self, current_price: float) -> float:
         """Calculate unrealized P&L for current position."""
@@ -343,15 +488,23 @@ class BacktestEngine:
         initial_capital: float = 1_000_000.0,
         fee_pct: float = 0.035,
         warmup_bars: int = 0,
+        fill_on_bar_close: bool = False,
+        calc_on_order_fills: bool = True,
     ) -> SummaryStats:
         """Run backtest in fast mode — returns summary stats only.
 
         Args:
             warmup_bars: Number of initial bars to skip for indicator warmup.
-                         TradingView loads extra bars before the visible range,
-                         so set this to match the indicator convergence period.
+            fill_on_bar_close: If True, fill orders at previous bar's close
+                              instead of current bar's open (TradingView's
+                              "On bar close" / process_orders_on_close).
+            calc_on_order_fills: If True, recalculate entry qty after close
+                                fills using updated equity (TradingView's
+                                "After order is filled" / calc_on_order_fills).
         """
-        ctx = Context(bars, initial_capital, fee_pct, detail=False)
+        ctx = Context(bars, initial_capital, fee_pct, detail=False,
+                      fill_on_bar_close=fill_on_bar_close,
+                      calc_on_order_fills=calc_on_order_fills)
         return BacktestEngine._run(strategy, bars, params, ctx, warmup_bars)
 
     @staticmethod
@@ -362,13 +515,19 @@ class BacktestEngine:
         initial_capital: float = 1_000_000.0,
         fee_pct: float = 0.035,
         warmup_bars: int = 0,
+        fill_on_bar_close: bool = False,
+        calc_on_order_fills: bool = True,
     ) -> DetailedResult:
         """Run backtest in detail mode — returns stats + trades + equity curve.
 
         Args:
             warmup_bars: Number of initial bars to skip for indicator warmup.
+            fill_on_bar_close: See run_fast.
+            calc_on_order_fills: See run_fast.
         """
-        ctx = Context(bars, initial_capital, fee_pct, detail=True)
+        ctx = Context(bars, initial_capital, fee_pct, detail=True,
+                      fill_on_bar_close=fill_on_bar_close,
+                      calc_on_order_fills=calc_on_order_fills)
         stats = BacktestEngine._run(strategy, bars, params, ctx, warmup_bars)
         return DetailedResult(
             stats=stats,
@@ -394,6 +553,7 @@ class BacktestEngine:
         strategy.init(ctx)
 
         n = len(bars)
+        prev_close = 0.0
 
         # Bar-by-bar loop
         for i in range(n):
@@ -408,8 +568,8 @@ class BacktestEngine:
                 volume=bars.volume[i],
             )
 
-            # Fill pending orders from previous bar at this bar's open
-            ctx._fill_pending_orders(bar)
+            # Fill pending orders from previous bar
+            ctx._fill_pending_orders(bar, prev_bar_close=prev_close)
 
             # Run strategy logic (skip warmup bars for trading, but
             # indicators are already computed over all bars in init())
@@ -418,6 +578,8 @@ class BacktestEngine:
 
             # Track equity/drawdown at bar close
             ctx._process_orders(bar)
+
+            prev_close = bar.close
 
             # Record equity (detail mode)
             if ctx.detail:

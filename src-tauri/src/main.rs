@@ -499,6 +499,8 @@ struct WorkerInfo {
     status: String,      // "idle", "running", "done", "error"
     progress: f64,
     combos: usize,
+    elapsed: f64,        // seconds elapsed for this worker's sweep
+    error: String,       // error message if any
 }
 
 /// Check if a worker is reachable and get its info
@@ -523,6 +525,8 @@ async fn check_worker(address: String) -> Result<WorkerInfo, String> {
         status: "idle".to_string(),
         progress: 0.0,
         combos: 0,
+        elapsed: 0.0,
+        error: String::new(),
     })
 }
 
@@ -553,6 +557,44 @@ async fn send_data_to_worker(
         .send()
         .await
         .map_err(|e| format!("Failed to send data to {}: {}", address, e))?;
+
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+/// Send strategy file to a worker
+#[tauri::command]
+async fn send_strategy_to_worker(
+    address: String,
+    strategy: String,
+) -> Result<String, String> {
+    // Read strategy source code
+    let strategies_dir = get_strategies_dir()?;
+    let strategy_path = strategies_dir.join(format!("{}.py", strategy));
+
+    let code = if strategy_path.exists() {
+        std::fs::read_to_string(&strategy_path)
+            .map_err(|e| format!("Failed to read strategy: {}", e))?
+    } else {
+        String::new() // Worker may already have the strategy
+    };
+
+    let payload = serde_json::json!({
+        "name": strategy,
+        "code": code,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .post(format!("http://{}/load-strategy", address))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send strategy to {}: {}", address, e))?;
 
     let body = resp.text().await.map_err(|e| e.to_string())?;
     Ok(body)
@@ -610,9 +652,13 @@ async fn poll_worker(address: String) -> Result<WorkerInfo, String> {
     Ok(WorkerInfo {
         address: address.clone(),
         name: data["name"].as_str().unwrap_or("Unknown").to_string(),
-        status: if data["running"].as_bool().unwrap_or(false) { "running" } else { "done" }.to_string(),
+        status: data["status"].as_str().unwrap_or(
+            if data["running"].as_bool().unwrap_or(false) { "running" } else { "idle" }
+        ).to_string(),
         progress: data["progress"].as_f64().unwrap_or(0.0),
         combos: data["total_combos"].as_u64().unwrap_or(0) as usize,
+        elapsed: data["elapsed"].as_f64().unwrap_or(0.0),
+        error: data["error"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -651,9 +697,575 @@ async fn stop_worker(address: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Reset a worker — clears all state (stop + clear results)
+#[tauri::command]
+async fn reset_worker(address: String) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    client
+        .post(format!("http://{}/reset", address))
+        .send()
+        .await
+        .map_err(|e| format!("Cannot reach {}: {}", address, e))?;
+
+    Ok(())
+}
+
 // ============================================================
+// ============================================================
+// Python Backtester Integration
+// ============================================================
+
+/// Find the Python executable (tries python, python3, venv)
+fn find_python() -> Result<String, String> {
+    // Check for venv in the python directory
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    if let Some(dir) = &exe_dir {
+        // Check sibling python/venv
+        let venv_python = dir.join("python").join("venv").join("Scripts").join("python.exe");
+        if venv_python.exists() {
+            return Ok(venv_python.to_string_lossy().to_string());
+        }
+        // Linux/Mac venv
+        let venv_python = dir.join("python").join("venv").join("bin").join("python3");
+        if venv_python.exists() {
+            return Ok(venv_python.to_string_lossy().to_string());
+        }
+    }
+
+    // Try system Python
+    for cmd in &["python", "python3"] {
+        let result = std::process::Command::new(cmd)
+            .arg("--version")
+            .output();
+        if let Ok(output) = result {
+            if output.status.success() {
+                return Ok(cmd.to_string());
+            }
+        }
+    }
+
+    Err("Python not found. Install Python 3.10+ and ensure it's in your PATH.".to_string())
+}
+
+/// Find the python/ directory containing sweep.py
+fn find_python_dir() -> Result<PathBuf, String> {
+    let exe_dir = std::env::current_exe()
+        .map_err(|e| format!("Cannot find exe dir: {}", e))?
+        .parent()
+        .ok_or("Cannot find exe parent dir")?
+        .to_path_buf();
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    // In dev mode: src-tauri/target/debug/ -> src-tauri/python/
+    // In release:  alongside exe -> python/
+    let candidates = vec![
+        exe_dir.join("python"),                                    // release: python/ beside exe
+        exe_dir.join("..").join("..").join("..").join("python"),    // dev: target/debug/ -> src-tauri/python/
+        exe_dir.join("..").join("..").join("python"),               // dev: alt layout
+        cwd.join("src-tauri").join("python"),                       // CWD = project root
+        cwd.join("python"),                                         // CWD = src-tauri
+        PathBuf::from("src-tauri").join("python"),                  // relative
+        PathBuf::from("python"),                                    // relative
+    ];
+
+    for candidate in &candidates {
+        let sweep_path = candidate.join("sweep.py");
+        if sweep_path.exists() {
+            return Ok(candidate.canonicalize().unwrap_or(candidate.clone()));
+        }
+    }
+
+    Err(format!(
+        "Cannot find python/sweep.py. exe_dir={}, cwd={}, Searched: {:?}",
+        exe_dir.display(), cwd.display(),
+        candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>()
+    ))
+}
+
+/// Get the strategies directory in user data (outside src-tauri to avoid file watcher issues).
+/// On first run, copies bundled strategies from the source python/strategies/ dir.
+fn get_strategies_dir() -> Result<PathBuf, String> {
+    // User data directory: %APPDATA%/StrategyOptimizer/strategies/
+    let user_dir = if let Ok(appdata) = std::env::var("APPDATA") {
+        PathBuf::from(appdata).join("StrategyOptimizer").join("strategies")
+    } else if let Ok(home) = std::env::var("USERPROFILE") {
+        PathBuf::from(home).join("StrategyOptimizer").join("strategies")
+    } else {
+        // Fallback: use a temp-like directory
+        PathBuf::from("strategies")
+    };
+
+    std::fs::create_dir_all(&user_dir)
+        .map_err(|e| format!("Cannot create strategies dir: {}", e))?;
+
+    // Copy bundled strategies on first run (don't overwrite existing)
+    if let Ok(python_dir) = find_python_dir() {
+        let bundled_dir = python_dir.join("strategies");
+        if bundled_dir.exists() {
+            // Also ensure __init__.py exists in user dir
+            let init_path = user_dir.join("__init__.py");
+            if !init_path.exists() {
+                let _ = std::fs::write(&init_path, "# Trading strategies\n");
+            }
+
+            if let Ok(entries) = std::fs::read_dir(&bundled_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "py") {
+                        let dest = user_dir.join(path.file_name().unwrap());
+                        // Only copy if destination doesn't exist or is empty (was zeroed)
+                        let should_copy = if dest.exists() {
+                            dest.metadata().map_or(true, |m| m.len() == 0)
+                        } else {
+                            true
+                        };
+                        if should_copy {
+                            let _ = std::fs::copy(&path, &dest);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(user_dir)
+}
+
+/// Build PYTHONPATH that includes both the engine dir and the strategies parent dir.
+/// This lets `from strategies.xxx import Xxx` work from the user data directory.
+fn build_python_path() -> Result<String, String> {
+    let python_dir = find_python_dir()?;
+    let strategies_dir = get_strategies_dir()?;
+    // strategies_dir is like %APPDATA%/StrategyOptimizer/strategies/
+    // We need the parent (%APPDATA%/StrategyOptimizer/) on PYTHONPATH
+    // It MUST come first so the strategies package resolves from AppData
+    let strategies_parent = strategies_dir.parent()
+        .ok_or("Cannot get strategies parent dir")?
+        .to_path_buf();
+
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    Ok(format!("{}{}{}",
+        strategies_parent.to_string_lossy(),
+        sep,
+        python_dir.to_string_lossy(), 
+    ))
+}
+
+/// Run a parameter sweep using the Python backtester
+#[tauri::command]
+async fn run_python_sweep(
+    strategy: String,
+    config_json: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    // Check if already running
+    {
+        let running = state.running.lock().unwrap();
+        if *running {
+            return Err("Sweep already in progress".to_string());
+        }
+    }
+
+    // Get data path
+    let data_path = {
+        let guard = state.data_path.lock().unwrap();
+        guard.as_ref()
+            .ok_or("No data loaded. Load a CSV first.")?
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let python = find_python()?;
+    let python_dir = find_python_dir()?;
+    let python_path = build_python_path()?;
+    let sweep_script = python_dir.join("sweep.py");
+
+    // Parse config to validate it
+    let config: serde_json::Value = serde_json::from_str(&config_json)
+        .map_err(|e| format!("Invalid config JSON: {}", e))?;
+
+    // Build the subprocess input
+    let subprocess_input = serde_json::json!({
+        "strategy": strategy,
+        "data_path": data_path,
+        "config": config,
+    });
+
+    // Mark as running
+    *state.running.lock().unwrap() = true;
+    *state.progress.lock().unwrap() = 0.0;
+
+    let app_handle = app.clone();
+
+    // Run in background thread
+    let result = tokio::task::spawn_blocking(move || {
+        use std::process::{Command, Stdio};
+        use std::io::{Write, BufRead, BufReader};
+
+        let mut cmd = Command::new(&python);
+        cmd.arg(sweep_script.to_string_lossy().as_ref())
+            .arg("--stdin")
+            .env("PYTHONPATH", &python_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // On Windows, prevent a console window from popping up
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let mut child = cmd.spawn()
+            .map_err(|e| format!("Failed to start Python: {}. Python path: {}", e, python))?;
+
+        // Write input to stdin
+        {
+            let stdin = child.stdin.as_mut()
+                .ok_or("Failed to open Python stdin")?;
+            let input_bytes = serde_json::to_vec(&subprocess_input)
+                .map_err(|e| format!("Failed to serialize input: {}", e))?;
+            stdin.write_all(&input_bytes)
+                .map_err(|e| format!("Failed to write to Python stdin: {}", e))?;
+        }
+        // Close stdin to signal EOF
+        drop(child.stdin.take());
+
+        // Read stderr in a thread for progress updates
+        let stderr = child.stderr.take()
+            .ok_or("Failed to open Python stderr")?;
+        let app_for_progress = app_handle.clone();
+        let stderr_thread = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let mut last_errors = Vec::new();
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if line.starts_with("PROGRESS:") {
+                        if let Ok(pct) = line[9..].trim().parse::<f64>() {
+                            let _ = app_for_progress.emit("sweep-progress", pct);
+                        }
+                    } else if !line.is_empty() {
+                        last_errors.push(line);
+                        // Keep only last 20 error lines
+                        if last_errors.len() > 20 {
+                            last_errors.remove(0);
+                        }
+                    }
+                }
+            }
+            last_errors
+        });
+
+        // Read stdout (results JSON)
+        let stdout = child.stdout.take()
+            .ok_or("Failed to open Python stdout")?;
+        let mut stdout_data = String::new();
+        use std::io::Read;
+        BufReader::new(stdout).read_to_string(&mut stdout_data)
+            .map_err(|e| format!("Failed to read Python output: {}", e))?;
+
+        // Wait for process to finish
+        let status = child.wait()
+            .map_err(|e| format!("Failed to wait for Python: {}", e))?;
+
+        let stderr_lines = stderr_thread.join()
+            .map_err(|_| "Stderr thread panicked".to_string())?;
+
+        if !status.success() {
+            let error_context = if stderr_lines.is_empty() {
+                "No error output".to_string()
+            } else {
+                stderr_lines.join("\n")
+            };
+            return Err(format!(
+                "Python sweep failed (exit code {:?}):\n{}",
+                status.code(), error_context
+            ));
+        }
+
+        // Parse the output JSON
+        let output: serde_json::Value = serde_json::from_str(&stdout_data)
+            .map_err(|e| format!(
+                "Failed to parse Python output: {}. Raw output (first 500 chars): {}",
+                e, &stdout_data[..stdout_data.len().min(500)]
+            ))?;
+
+        Ok(output)
+    })
+    .await
+    .map_err(|e| format!("Python sweep task failed: {}", e))?;
+
+    // Mark as done
+    *state.running.lock().unwrap() = false;
+    *state.progress.lock().unwrap() = 1.0;
+
+    match result {
+        Ok(output) => serde_json::to_string(&output)
+            .map_err(|e| format!("Failed to serialize results: {}", e)),
+        Err(e) => {
+            *state.running.lock().unwrap() = false;
+            Err(e)
+        }
+    }
+}
+
+/// List available Python strategies
+#[tauri::command]
+fn list_python_strategies() -> Result<Vec<StrategyInfo>, String> {
+    let strategies_dir = get_strategies_dir()?;
+
+    let mut strategies = Vec::new();
+
+    if strategies_dir.exists() {
+        for entry in std::fs::read_dir(&strategies_dir)
+            .map_err(|e| format!("Cannot read strategies dir: {}", e))? {
+            let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "py") {
+                let name = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name != "__init__" && name != "__pycache__" {
+                    strategies.push(StrategyInfo {
+                        name: name.clone(),
+                        display_name: name.replace('_', " ")
+                            .split_whitespace()
+                            .map(|w| {
+                                let mut c = w.chars();
+                                match c.next() {
+                                    None => String::new(),
+                                    Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        file: path.to_string_lossy().to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(strategies)
+}
+
+/// Get parameter metadata for a Python strategy
+#[tauri::command]
+fn get_python_params(strategy: String) -> Result<String, String> {
+    let python = find_python()?;
+    let python_dir = find_python_dir()?;
+    let python_path = build_python_path().unwrap_or(python_dir.to_string_lossy().to_string());
+    let script = python_dir.join("get_params.py");
+
+    let output = std::process::Command::new(&python)
+        .arg(script.to_string_lossy().as_ref())
+        .arg(&strategy)
+        .env("PYTHONPATH", &python_path)
+        .output()
+        .map_err(|e| format!("Failed to run get_params.py: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("get_params.py failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // Validate it's valid JSON
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .map_err(|e| format!("Invalid JSON from get_params.py: {}", e))?;
+
+    Ok(stdout)
+}
+
+#[derive(Serialize)]
+struct StrategyInfo {
+    name: String,
+    display_name: String,
+    file: String,
+}
+
+/// Translate Pine Script to Python strategy using Claude API
+#[tauri::command]
+async fn translate_pine(pine_code: String, name: String, api_key: String) -> Result<String, String> {
+    let python = find_python()?;
+    let python_dir = find_python_dir()?;
+    let script = python_dir.join("pine_translator.py");
+
+    if !script.exists() {
+        return Err(format!("pine_translator.py not found at {:?}", script));
+    }
+
+    let input_json = serde_json::json!({
+        "pine_code": pine_code,
+        "name": name,
+        "api_key": api_key,
+    });
+
+    let python_owned = python.clone();
+    let script_str = script.to_string_lossy().to_string();
+    let python_path_str = build_python_path().unwrap_or(python_dir.to_string_lossy().to_string());
+    let input_str = input_json.to_string();
+
+    let output = tokio::task::spawn_blocking(move || {
+        use std::process::{Command, Stdio};
+        use std::io::Write;
+
+        let mut child = Command::new(&python_owned)
+            .arg(&script_str)
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("PYTHONPATH", &python_path_str)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .spawn()
+            .map_err(|e| format!("Failed to spawn Python: {}", e))?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(input_str.as_bytes())
+                .map_err(|e| format!("Failed to write stdin: {}", e))?;
+        }
+
+        child.wait_with_output()
+            .map_err(|e| format!("Failed to wait for Python: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Translation failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(stdout)
+}
+
+/// Run a single parameter combo in detail mode — returns trade log
+#[tauri::command]
+async fn run_python_detail(strategy: String, config_json: String) -> Result<String, String> {
+    let python = find_python()?;
+    let python_dir = find_python_dir()?;
+    let script = python_dir.join("run_detail.py");
+
+    if !script.exists() {
+        return Err(format!("run_detail.py not found at {:?}", script));
+    }
+
+    let python_owned = python.clone();
+    let script_str = script.to_string_lossy().to_string();
+    let python_path_str = build_python_path().unwrap_or(python_dir.to_string_lossy().to_string());
+    let config = config_json.clone();
+
+    let output = tokio::task::spawn_blocking(move || {
+        use std::process::{Command, Stdio};
+        use std::io::Write;
+
+        let mut child = Command::new(&python_owned)
+            .arg(&script_str)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("PYTHONPATH", &python_path_str)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .spawn()
+            .map_err(|e| format!("Failed to spawn Python: {}", e))?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(config.as_bytes())
+                .map_err(|e| format!("Failed to write stdin: {}", e))?;
+        }
+
+        child.wait_with_output()
+            .map_err(|e| format!("Failed to wait for Python: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("run_detail.py failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    
+    // Validate JSON
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .map_err(|e| format!("Invalid JSON from run_detail.py: {}", e))?;
+
+    Ok(stdout)
+}
+
 // Main
 // ============================================================
+
+/// Save a Python strategy file to the strategies directory
+#[tauri::command]
+fn save_python_strategy(name: String, code: String) -> Result<String, String> {
+    // Never overwrite a strategy with empty code
+    if code.trim().is_empty() {
+        return Err("Cannot save empty strategy file".to_string());
+    }
+
+    let strategies_dir = get_strategies_dir()?;
+
+    // Sanitize name: lowercase, replace spaces with underscores, strip .py
+    let clean_name = name
+        .trim()
+        .to_lowercase()
+        .replace(' ', "_")
+        .replace(".py", "");
+
+    if clean_name.is_empty() {
+        return Err("Strategy name cannot be empty".to_string());
+    }
+
+    let path = strategies_dir.join(format!("{}.py", clean_name));
+    std::fs::write(&path, &code)
+        .map_err(|e| format!("Cannot write strategy file: {}", e))?;
+
+    Ok(format!("Saved to {}", path.display()))
+}
+
+/// Read a Python strategy file's source code
+#[tauri::command]
+fn read_python_strategy(name: String) -> Result<String, String> {
+    let strategies_dir = get_strategies_dir()?;
+    let path = strategies_dir.join(format!("{}.py", name));
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {}: {}", path.display(), e))
+}
+
+#[tauri::command]
+fn delete_python_strategy(name: String) -> Result<String, String> {
+    let strategies_dir = get_strategies_dir()?;
+    let path = strategies_dir.join(format!("{}.py", name));
+    if !path.exists() {
+        return Err(format!("Strategy not found: {}", name));
+    }
+    // Don't allow deleting built-in strategies
+    let builtins = ["mesa_mama_fama", "larry_williams", "pure_orb"];
+    if builtins.contains(&name.as_str()) {
+        return Err("Cannot delete built-in strategy".to_string());
+    }
+    std::fs::remove_file(&path)
+        .map_err(|e| format!("Failed to delete {}: {}", path.display(), e))?;
+    Ok(format!("Deleted {}.py", name))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -663,6 +1275,14 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             parse_pine_script,
             run_pine_sweep,
+            run_python_sweep,
+            run_python_detail,
+            translate_pine,
+            list_python_strategies,
+            get_python_params,
+            save_python_strategy,
+            read_python_strategy,
+            delete_python_strategy,
             load_data,
             run_sweep,
             stop_sweep,
@@ -676,10 +1296,12 @@ fn main() {
             get_version,
             check_worker,
             send_data_to_worker,
+            send_strategy_to_worker,
             start_worker_sweep,
             poll_worker,
             get_worker_results,
             stop_worker,
+            reset_worker,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
