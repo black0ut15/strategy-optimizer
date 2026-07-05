@@ -320,7 +320,9 @@ function ParamRow({ p, onUpdate }) {
 // ============================================================
 function generateConfig(params, settings) {
   // Flat parameter map for Pine interpreter sweep (keyed by variable name)
-  const config = { parameters: {}, sweep_settings: settings };
+  // Strip stale keys that are dynamically rebuilt below
+  const { sweep_date_categories, blocked_date_categories, ...cleanSettings } = settings;
+  const config = { parameters: {}, sweep_settings: cleanSettings };
 
   for (const p of params) {
     if (p.type === "bool") {
@@ -345,6 +347,28 @@ function generateConfig(params, settings) {
         config.parameters[p.id] = [p.value];
       }
     }
+  }
+
+  // Build blocked_date_categories from individual toggles
+  // States: "off" = not included, "on" = always blocked, "sweep" = test both
+  const blockedCategories = [];
+  const catMap = {
+    block_fomc: "fomc", block_nfp: "nfp", block_pre_nfp: "pre_nfp",
+    block_cpi: "cpi", block_triple_witching: "triple_witching",
+    block_monthly_opex: "monthly_opex", block_early_close: "early_close",
+    block_post_holiday: "post_holiday",
+  };
+  for (const [key, cat] of Object.entries(catMap)) {
+    const val = settings[key] || "off";
+    if (val === "on") {
+      blockedCategories.push(cat);
+    } else if (val === "sweep") {
+      // Add as a boolean parameter to the sweep grid
+      config.parameters[`__block_${cat}`] = [true, false];
+    }
+  }
+  if (blockedCategories.length > 0) {
+    config.sweep_settings.blocked_date_categories = blockedCategories;
   }
 
   return JSON.stringify(config, null, 2);
@@ -376,14 +400,16 @@ export default function StrategyLab({ onRunSweep, onRunPythonSweep, onLoadData, 
       const s = localStorage.getItem("so_sweepSettings");
       const defaults = {
         fee_pct: 0, max_dd_pct: 100, min_trades: 0, top_n: 200, sort_by: "pf", output: "results.csv",
-        initial_capital: 10000, warmup_bars: 0,
+        initial_capital: 10000, warmup_bars: 0, trade_start_date: "",
         calc_on_order_fills: true, fill_on_bar_close: false, on_every_tick: true, use_standard_ohlc: false,
+        discord_notify: false, discord_webhook_url: "",
       };
       return s ? { ...defaults, ...JSON.parse(s) } : defaults;
     } catch { return {
       fee_pct: 0, max_dd_pct: 100, min_trades: 0, top_n: 200, sort_by: "pf", output: "results.csv",
-      initial_capital: 10000, warmup_bars: 0,
+      initial_capital: 10000, warmup_bars: 0, trade_start_date: "",
       calc_on_order_fills: true, fill_on_bar_close: false, on_every_tick: true, use_standard_ohlc: false,
+      discord_notify: false, discord_webhook_url: "",
     }; }
   });
   const [showJson, setShowJson] = useState(false);
@@ -717,6 +743,11 @@ export default function StrategyLab({ onRunSweep, onRunPythonSweep, onLoadData, 
                           }
                         }
                         
+                        // Show post-translation validation results
+                        if (result.validation) {
+                          msg += `\n\n── Post-Translation Validator ──\n${result.validation}`;
+                        }
+                        
                         alert(msg);
                         const list = await invoke("list_python_strategies");
                         setPyStrategies(list);
@@ -953,20 +984,111 @@ export default function StrategyLab({ onRunSweep, onRunPythonSweep, onLoadData, 
 
             {/* Sweep Settings */}
             <div className="mb-5">
-              <div className="text-xs text-zinc-500 tracking-wider font-medium mb-1 px-1 py-1">SWEEP SETTINGS</div>
+              <div className="mt-6 mb-3 border-t-2 border-emerald-500/30 pt-4">
+                <div className="text-sm text-emerald-400 tracking-wider font-bold mb-1 px-1 py-1">SWEEP SETTINGS</div>
+              </div>
               {[
                 { k: "initial_capital", l: "Initial Capital $", s: 1000 },
                 { k: "fee_pct", l: "Fee % (round-trip)", s: 0.01 },
                 { k: "max_dd_pct", l: "Max Drawdown %", s: 1 },
                 { k: "min_trades", l: "Min Trades", s: 5 },
                 { k: "top_n", l: "Top N Results", s: 10 },
-                { k: "warmup_bars", l: "Warmup Bars", s: 50 },
               ].map(({ k, l, s }) => (
                 <div key={k} className="flex items-center justify-between py-2.5 px-1 border-b border-zinc-800/40">
                   <span className="text-sm text-zinc-300">{l}</span>
                   <NumInput value={settings[k]} onChange={v => setSettings(prev => ({...prev, [k]: v}))} step={s} className="w-28" />
                 </div>
               ))}
+
+              {/* Contract Value / Point Multiplier for futures */}
+              <div className="flex items-center justify-between py-2.5 px-1 border-b border-zinc-800/40">
+                <span className="text-sm text-zinc-300" title="Point multiplier: Crypto=1, MES/MYM=$5, MNQ=$2, ES/YM=$50, NQ=$20, GC=$100, MGC=$10">Contract Value $</span>
+                <select
+                  value={settings.contract_value || 1}
+                  onChange={e => setSettings(prev => ({...prev, contract_value: parseFloat(e.target.value)}))}
+                  className="w-28 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm rounded px-2 py-1 focus:border-emerald-500/50 outline-none"
+                >
+                  <option value={1}>1 (Crypto)</option>
+                  <option value={2}>2 (MNQ)</option>
+                  <option value={5}>5 (MES/MYM/MBT)</option>
+                  <option value={10}>10 (MGC)</option>
+                  <option value={20}>20 (NQ)</option>
+                  <option value={50}>50 (ES/YM)</option>
+                  <option value={100}>100 (GC)</option>
+                </select>
+              </div>
+
+              {/* Trade Start Date — auto-calculates warmup_bars from data start */}
+              <div className="flex items-center justify-between py-2.5 px-1 border-b border-zinc-800/40">
+                <div>
+                  <span className="text-sm text-zinc-300">Trade Start Date</span>
+                  {settings.trade_start_date && dataInfo && (
+                    <span className="text-xs text-zinc-600 ml-2">
+                      ({settings.warmup_bars} warmup bars)
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="date"
+                    value={settings.trade_start_date || ""}
+                    onChange={e => {
+                      const dateStr = e.target.value;
+                      let warmupBars = 0;
+                      if (dateStr && dataInfo) {
+                        // Parse data start timestamp
+                        let dataStartMs = 0;
+                        const fd = dataInfo.first_date;
+                        if (typeof fd === "number" || (typeof fd === "string" && /^\d+$/.test(fd))) {
+                          dataStartMs = parseInt(fd);
+                          if (dataStartMs < 1e12) dataStartMs *= 1000; // seconds to ms
+                        } else if (typeof fd === "string") {
+                          dataStartMs = new Date(fd).getTime();
+                        }
+                        const tradeStartMs = new Date(dateStr + "T00:00:00Z").getTime();
+                        if (dataStartMs > 0 && tradeStartMs > dataStartMs) {
+                          // Estimate bar interval from data
+                          let barIntervalMs = 300000; // default 5m
+                          if (dataInfo.timeframe) {
+                            const tf = dataInfo.timeframe;
+                            const tfMins = {"1m":1,"3m":3,"5m":5,"10m":10,"15m":15,"30m":30,"1h":60,"2h":120,"4h":240,"6h":360,"1d":1440}[tf];
+                            if (tfMins) barIntervalMs = tfMins * 60000;
+                          } else if (dataInfo.bars > 1) {
+                            // Estimate from total duration / bars
+                            let dataEndMs = 0;
+                            const ld = dataInfo.last_date;
+                            if (typeof ld === "number" || (typeof ld === "string" && /^\d+$/.test(ld))) {
+                              dataEndMs = parseInt(ld);
+                              if (dataEndMs < 1e12) dataEndMs *= 1000;
+                            } else if (typeof ld === "string") {
+                              dataEndMs = new Date(ld).getTime();
+                            }
+                            if (dataEndMs > dataStartMs) {
+                              barIntervalMs = (dataEndMs - dataStartMs) / dataInfo.bars;
+                            }
+                          }
+                          warmupBars = Math.round((tradeStartMs - dataStartMs) / barIntervalMs);
+                        }
+                      }
+                      setSettings(prev => ({...prev, trade_start_date: dateStr, warmup_bars: warmupBars}));
+                    }}
+                    className="bg-zinc-800 border border-zinc-700 rounded px-2.5 py-1.5 text-sm text-zinc-200 w-36 focus:border-blue-500 focus:outline-none hover:border-zinc-600 transition-colors"
+                  />
+                  {settings.trade_start_date && (
+                    <button
+                      onClick={() => setSettings(prev => ({...prev, trade_start_date: "", warmup_bars: 0}))}
+                      className="text-xs text-zinc-600 hover:text-zinc-400 transition-colors"
+                      title="Clear trade start date"
+                    >✕</button>
+                  )}
+                </div>
+              </div>
+              {!settings.trade_start_date && (
+                <div className="flex items-center justify-between py-2.5 px-1 border-b border-zinc-800/40">
+                  <span className="text-sm text-zinc-300">Warmup Bars</span>
+                  <NumInput value={settings.warmup_bars} onChange={v => setSettings(prev => ({...prev, warmup_bars: v}))} step={50} className="w-28" />
+                </div>
+              )}
               <div className="flex items-center justify-between py-2.5 px-1 border-b border-zinc-800/40">
                 <span className="text-sm text-zinc-300">Sort By</span>
                 <SelectInput
@@ -1017,9 +1139,91 @@ export default function StrategyLab({ onRunSweep, onRunPythonSweep, onLoadData, 
                   />
                 </label>
               ))}
-            </div>
 
-            {/* Warning */}
+              {/* Market Event Date Filters */}
+              <div className="text-xs text-zinc-600 tracking-wider font-medium mt-4 mb-1 px-1 py-1 flex items-center justify-between">
+                <span>BLOCK ENTRIES ON EVENT DATES</span>
+                <button
+                  onClick={async () => {
+                    try {
+                      const { invoke } = await import("@tauri-apps/api/core");
+                      const result = await invoke("run_fetch_blocked_dates");
+                      alert(`Fetched event dates: ${result}`);
+                    } catch (e) {
+                      // Fallback: run Python directly
+                      try {
+                        const { invoke } = await import("@tauri-apps/api/core");
+                        await invoke("run_python_script", { script: "fetch_blocked_dates.py", args: [] });
+                        alert("Fetched event dates successfully!");
+                      } catch (e2) {
+                        alert(`Run fetch_blocked_dates.py manually:\npython src-tauri/python/fetch_blocked_dates.py`);
+                      }
+                    }
+                  }}
+                  className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                  title="Fetch/update event dates from Finnhub API"
+                >↻ Fetch Dates</button>
+              </div>
+              {[
+                { k: "block_fomc", l: "FOMC Meetings", tip: "Block entries on Federal Reserve rate decision days" },
+                { k: "block_nfp", l: "NFP / Jobs Report", tip: "Block entries on Non-Farm Payrolls release days" },
+                { k: "block_pre_nfp", l: "Pre-NFP (day before)", tip: "Block entries the day before NFP release" },
+                { k: "block_cpi", l: "CPI Report", tip: "Block entries on Consumer Price Index release days" },
+                { k: "block_triple_witching", l: "Triple Witching", tip: "Block entries on quarterly triple witching expiration (3rd Fri of Mar/Jun/Sep/Dec)" },
+                { k: "block_monthly_opex", l: "Monthly OpEx", tip: "Block entries on monthly options expiration (3rd Friday)" },
+                { k: "block_early_close", l: "Early Close Days", tip: "Block entries on market early close days (July 3, Black Friday, Dec 24)" },
+                { k: "block_post_holiday", l: "Post-Holiday", tip: "Block entries on the day after major holiday closures" },
+              ].map(({ k, l, tip }) => {
+                // 3 states: "off" (not blocked), "on" (always blocked), "sweep" (test both)
+                const val = settings[k] || "off";
+                return (
+                  <div key={k} className="flex items-center justify-between py-2 px-1 border-b border-zinc-800/40">
+                    <span className="text-sm text-zinc-300" title={tip}>{l}</span>
+                    <div className="flex items-center gap-1">
+                      {[
+                        { v: "off", label: "Off", color: "text-zinc-500 border-zinc-700" },
+                        { v: "on", label: "On", color: "text-emerald-400 border-emerald-600" },
+                        { v: "sweep", label: "Sweep", color: "text-amber-400 border-amber-600" },
+                      ].map(opt => (
+                        <button
+                          key={opt.v}
+                          onClick={() => setSettings(prev => ({...prev, [k]: opt.v}))}
+                          className={`px-2 py-0.5 text-xs rounded border transition-all ${
+                            val === opt.v
+                              ? `${opt.color} bg-zinc-800 font-medium`
+                              : "text-zinc-600 border-zinc-800 hover:border-zinc-700"
+                          }`}
+                        >{opt.label}</button>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Discord Webhook Notification */}
+              <div className="text-xs text-zinc-600 tracking-wider font-medium mt-4 mb-1 px-1 py-1">NOTIFICATIONS</div>
+              <label className="flex items-center justify-between py-2 px-1 border-b border-zinc-800/40 cursor-pointer group">
+                <span className="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Discord on sweep complete</span>
+                <input
+                  type="checkbox"
+                  checked={!!settings.discord_notify}
+                  onChange={e => setSettings(prev => ({...prev, discord_notify: e.target.checked}))}
+                  className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-emerald-500 focus:ring-emerald-500/30 cursor-pointer"
+                />
+              </label>
+              {settings.discord_notify && (
+                <div className="flex items-center justify-between py-2.5 px-1 border-b border-zinc-800/40">
+                  <span className="text-sm text-zinc-300">Webhook URL</span>
+                  <input
+                    type="text"
+                    value={settings.discord_webhook_url || ""}
+                    onChange={e => setSettings(prev => ({...prev, discord_webhook_url: e.target.value}))}
+                    placeholder="https://discord.com/api/webhooks/..."
+                    className="bg-zinc-800 border border-zinc-700 rounded px-2.5 py-1.5 text-sm text-zinc-200 w-64 text-right focus:border-blue-500 focus:outline-none hover:border-zinc-600 transition-colors placeholder:text-zinc-700"
+                  />
+                </div>
+              )}
+            </div>
             {totalCombos > 5_000_000 && (
               <div className={`rounded border px-3 py-2 text-xs mb-4 ${
                 totalCombos > 50_000_000

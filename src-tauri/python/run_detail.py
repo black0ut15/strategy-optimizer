@@ -56,6 +56,26 @@ def main():
     warmup_bars = settings.get("warmup_bars", 0)
     fill_on_bar_close = settings.get("fill_on_bar_close", False)
     calc_on_order_fills = settings.get("calc_on_order_fills", True)
+    contract_value = settings.get("contract_value", 1.0)
+
+    # Load blocked dates
+    blocked_dates = set()
+    blocked_categories = settings.get("blocked_date_categories", [])
+    if blocked_categories:
+        for candidate in [
+            os.path.join(_script_dir, "blocked_dates.json"),
+            os.path.join(_appdata, "StrategyOptimizer", "blocked_dates.json") if _appdata else "",
+        ]:
+            if candidate and os.path.exists(candidate):
+                try:
+                    with open(candidate) as f:
+                        all_dates = json.load(f)
+                    for cat in blocked_categories:
+                        if cat in all_dates:
+                            blocked_dates.update(all_dates[cat])
+                except Exception:
+                    pass
+                break
 
     # Load data
     data = np.genfromtxt(data_path, delimiter=",", skip_header=1)
@@ -91,6 +111,8 @@ def main():
         warmup_bars=warmup_bars,
         fill_on_bar_close=fill_on_bar_close,
         calc_on_order_fills=calc_on_order_fills,
+        blocked_dates=blocked_dates if blocked_dates else None,
+        contract_value=contract_value,
     )
 
     # Build output

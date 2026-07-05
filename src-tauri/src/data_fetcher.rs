@@ -102,12 +102,13 @@ pub async fn fetch_crypto(
 
     // Also check in the script's working directory (Python writes here)
     let alt_path = PathBuf::from(format!("data/crypto/{}_{}_{}d_bt.csv", symbol, interval, days));
-
-    // Also check relative to src-tauri (common when running in dev mode)
     let src_tauri_path = PathBuf::from(format!("src-tauri/data/crypto/{}_{}_{}d_bt.csv", symbol, interval, days));
+    let fetchers_path = get_fetchers_dir().join("data").join("crypto").join(format!("{}_{}_{}d_bt.csv", symbol, interval, days));
 
-    // Prefer the freshly written file from the script, copy to our data dir
-    let final_path = if alt_path.exists() {
+    let final_path = if fetchers_path.exists() {
+        std::fs::copy(&fetchers_path, &csv_path).ok();
+        csv_path.clone()
+    } else if alt_path.exists() {
         std::fs::copy(&alt_path, &csv_path).ok();
         csv_path.clone()
     } else if src_tauri_path.exists() {
@@ -168,8 +169,13 @@ pub async fn fetch_futures(
     let csv_path = data_dir.join(format!("{}_{}_{}d_bt.csv", symbol, interval, days));
     let alt_path = PathBuf::from(format!("data/futures/{}_{}_{}d_bt.csv", symbol, interval, days));
     let src_tauri_path = PathBuf::from(format!("src-tauri/data/futures/{}_{}_{}d_bt.csv", symbol, interval, days));
+    // Python fetcher writes to fetchers/data/futures/ (relative to its own location)
+    let fetchers_path = get_fetchers_dir().join("data").join("futures").join(format!("{}_{}_{}d_bt.csv", symbol, interval, days));
 
-    let final_path = if alt_path.exists() {
+    let final_path = if fetchers_path.exists() {
+        std::fs::copy(&fetchers_path, &csv_path).ok();
+        csv_path.clone()
+    } else if alt_path.exists() {
         std::fs::copy(&alt_path, &csv_path).ok();
         csv_path.clone()
     } else if src_tauri_path.exists() {
@@ -232,8 +238,12 @@ pub async fn fetch_stocks(
     let csv_path = data_dir.join(format!("{}_{}_{}d_bt.csv", symbol, interval, days));
     let alt_path = PathBuf::from(format!("data/stocks/{}_{}_{}d_bt.csv", symbol, interval, days));
     let src_tauri_path = PathBuf::from(format!("src-tauri/data/stocks/{}_{}_{}d_bt.csv", symbol, interval, days));
+    let fetchers_path = get_fetchers_dir().join("data").join("stocks").join(format!("{}_{}_{}d_bt.csv", symbol, interval, days));
 
-    let final_path = if alt_path.exists() {
+    let final_path = if fetchers_path.exists() {
+        std::fs::copy(&fetchers_path, &csv_path).ok();
+        csv_path.clone()
+    } else if alt_path.exists() {
         std::fs::copy(&alt_path, &csv_path).ok();
         csv_path.clone()
     } else if src_tauri_path.exists() {

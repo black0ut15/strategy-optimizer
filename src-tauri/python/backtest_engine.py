@@ -135,7 +135,8 @@ class Context:
     """
 
     def __init__(self, bars: Bars, initial_capital: float, fee_pct: float, detail: bool = False,
-                 fill_on_bar_close: bool = False, calc_on_order_fills: bool = True):
+                 fill_on_bar_close: bool = False, calc_on_order_fills: bool = True,
+                 blocked_dates: set = None, contract_value: float = 1.0):
         self.bars = bars
         self.initial_capital = initial_capital
         self.fee_pct = fee_pct  # per-side fee as percentage (e.g. 0.035 = 0.035%)
@@ -144,6 +145,13 @@ class Context:
         # TradingView fill/recalculation modes
         self.fill_on_bar_close = fill_on_bar_close      # process_orders_on_close
         self.calc_on_order_fills = calc_on_order_fills   # calc_on_order_fills
+
+        # Blocked dates for entry filtering (set of "YYYY-MM-DD" strings)
+        self._blocked_dates = blocked_dates or set()
+        self.is_entry_blocked = False  # Updated each bar by the engine
+
+        # Futures point multiplier (e.g. MES=$5, MNQ=$2, ES=$50, NQ=$20)
+        self.contract_value = contract_value
 
         # Position state
         self._direction = 0  # 0=flat, 1=long, -1=short
@@ -162,6 +170,10 @@ class Context:
         self._winning_trades = 0
         self._gross_profit = 0.0
         self._gross_loss = 0.0
+
+        # Expose trade tracking for strategies (matches Pine's strategy.closedtrades, etc.)
+        self.closed_trades_count = 0
+        self.last_trade_pnl = 0.0
 
         # Current bar
         self.bar_index = 0
@@ -373,21 +385,24 @@ class Context:
         if self._direction == 0:
             return
 
-        # P&L calculation
+        # P&L calculation (contract_value = point multiplier for futures)
+        cv = self.contract_value
         if self._direction == 1:
-            gross_pnl = (exit_price - self._entry_price) * self._qty
+            gross_pnl = (exit_price - self._entry_price) * self._qty * cv
         else:
-            gross_pnl = (self._entry_price - exit_price) * self._qty
+            gross_pnl = (self._entry_price - exit_price) * self._qty * cv
 
         # Fees: per-side on notional
-        entry_notional = self._entry_price * self._qty
-        exit_notional = exit_price * self._qty
+        entry_notional = self._entry_price * self._qty * cv
+        exit_notional = exit_price * self._qty * cv
         fee = (entry_notional + exit_notional) * (self.fee_pct / 100.0)
         net_pnl = gross_pnl - fee
 
         # Update equity
         self.equity += net_pnl
         self._total_trades += 1
+        self.closed_trades_count = self._total_trades
+        self.last_trade_pnl = net_pnl
 
         if net_pnl > 0:
             self._winning_trades += 1
@@ -490,6 +505,8 @@ class BacktestEngine:
         warmup_bars: int = 0,
         fill_on_bar_close: bool = False,
         calc_on_order_fills: bool = True,
+        blocked_dates: set = None,
+        contract_value: float = 1.0,
     ) -> SummaryStats:
         """Run backtest in fast mode — returns summary stats only.
 
@@ -501,10 +518,14 @@ class BacktestEngine:
             calc_on_order_fills: If True, recalculate entry qty after close
                                 fills using updated equity (TradingView's
                                 "After order is filled" / calc_on_order_fills).
+            blocked_dates: Set of "YYYY-MM-DD" strings — entries blocked on these dates.
+            contract_value: Point multiplier for futures (MES=5, MNQ=2, ES=50). Default 1.0 for crypto.
         """
         ctx = Context(bars, initial_capital, fee_pct, detail=False,
                       fill_on_bar_close=fill_on_bar_close,
-                      calc_on_order_fills=calc_on_order_fills)
+                      calc_on_order_fills=calc_on_order_fills,
+                      blocked_dates=blocked_dates,
+                      contract_value=contract_value)
         return BacktestEngine._run(strategy, bars, params, ctx, warmup_bars)
 
     @staticmethod
@@ -517,6 +538,8 @@ class BacktestEngine:
         warmup_bars: int = 0,
         fill_on_bar_close: bool = False,
         calc_on_order_fills: bool = True,
+        blocked_dates: set = None,
+        contract_value: float = 1.0,
     ) -> DetailedResult:
         """Run backtest in detail mode — returns stats + trades + equity curve.
 
@@ -524,10 +547,14 @@ class BacktestEngine:
             warmup_bars: Number of initial bars to skip for indicator warmup.
             fill_on_bar_close: See run_fast.
             calc_on_order_fills: See run_fast.
+            blocked_dates: Set of "YYYY-MM-DD" strings — entries blocked on these dates.
+            contract_value: Point multiplier for futures. Default 1.0 for crypto.
         """
         ctx = Context(bars, initial_capital, fee_pct, detail=True,
                       fill_on_bar_close=fill_on_bar_close,
-                      calc_on_order_fills=calc_on_order_fills)
+                      calc_on_order_fills=calc_on_order_fills,
+                      blocked_dates=blocked_dates,
+                      contract_value=contract_value)
         stats = BacktestEngine._run(strategy, bars, params, ctx, warmup_bars)
         return DetailedResult(
             stats=stats,
@@ -570,6 +597,17 @@ class BacktestEngine:
 
             # Fill pending orders from previous bar
             ctx._fill_pending_orders(bar, prev_bar_close=prev_close)
+
+            # Update blocked date status for this bar
+            if ctx._blocked_dates:
+                from datetime import datetime as _dt
+                ts = bar.timestamp
+                if ts > 1e12:
+                    ts /= 1000  # ms to seconds
+                bar_date = _dt.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+                ctx.is_entry_blocked = bar_date in ctx._blocked_dates
+            else:
+                ctx.is_entry_blocked = False
 
             # Run strategy logic (skip warmup bars for trading, but
             # indicators are already computed over all bars in init())

@@ -34,39 +34,110 @@ RATE_LIMIT_DELAY = 2.0
 
 # Symbol mapping: user-friendly -> (exchange_prefix, product_code)
 SYMBOL_MAP = {
-    # CME E-mini / Micro
-    "ES":  ("CME_MINI", "ES"),    # E-mini S&P 500
-    "NQ":  ("CME_MINI", "NQ"),    # E-mini Nasdaq 100
-    "YM":  ("CME_MINI", "YM"),    # E-mini Dow
-    "RTY": ("CME_MINI", "RTY"),   # E-mini Russell 2000
-    "MES": ("CME_MINI", "MES"),   # Micro E-mini S&P 500
-    "MNQ": ("CME_MINI", "MNQ"),  # Micro E-mini Nasdaq 100
-    "MYM": ("CME_MINI", "MYM"),  # Micro E-mini Dow
-    "M2K": ("CME_MINI", "M2K"),  # Micro E-mini Russell 2000
-    # NYMEX Energy
-    "CL":  ("NYMEX", "CL"),      # Crude Oil
-    "NG":  ("NYMEX", "NG"),      # Natural Gas
-    # COMEX Metals
-    "GC":  ("COMEX", "GC"),      # Gold
-    "SI":  ("COMEX", "SI"),      # Silver
-    # CBOT Bonds
-    "ZB":  ("CBOT", "ZB"),       # 30-Year Treasury
-    "ZN":  ("CBOT", "ZN"),       # 10-Year Treasury
-    # CBOT Grains
-    "ZC":  ("CBOT", "ZC"),       # Corn
-    "ZS":  ("CBOT", "ZS"),       # Soybeans
-    "ZW":  ("CBOT", "ZW"),       # Wheat
+    # ── CME E-mini Equity Index ──────────────────────────────────
+    "ES":   ("CME_MINI", "ES"),     # E-mini S&P 500 ($50/pt)
+    "NQ":   ("CME_MINI", "NQ"),     # E-mini Nasdaq 100 ($20/pt)
+    "YM":   ("CME_MINI", "YM"),     # E-mini Dow ($5/pt)
+    "RTY":  ("CME_MINI", "RTY"),    # E-mini Russell 2000 ($50/pt)
+    
+    # ── CME Micro Equity Index ───────────────────────────────────
+    "MES":  ("CME_MINI", "MES"),    # Micro E-mini S&P 500 ($5/pt)
+    "MNQ":  ("CME_MINI", "MNQ"),    # Micro E-mini Nasdaq 100 ($2/pt)
+    "MYM":  ("CME_MINI", "MYM"),    # Micro E-mini Dow ($0.50/pt)
+    "M2K":  ("CME_MINI", "M2K"),    # Micro E-mini Russell 2000 ($5/pt)
+    
+    # ── CME Crypto ───────────────────────────────────────────────
+    "BTC":  ("CME", "BTC"),         # Bitcoin Futures ($5/pt) ✓
+    "MBT":  ("CME", "MBT"),         # Micro Bitcoin ($0.10/pt) ✓
+    "ETH":  ("CME", "ETH"),         # Ether Futures ($50/pt) ✓
+    "MET":  ("CME", "MET"),         # Micro Ether ($0.10/pt) ✓
+    
+    # ── CME FX (Currency) ────────────────────────────────────────
+    "6E":   ("CME", "6E"),          # Euro FX ✓
+    "6J":   ("CME", "6J"),          # Japanese Yen
+    "6B":   ("CME", "6B"),          # British Pound
+    "6A":   ("CME", "6A"),          # Australian Dollar
+    "6C":   ("CME", "6C"),          # Canadian Dollar
+    "6S":   ("CME", "6S"),          # Swiss Franc
+    "6N":   ("CME", "6N"),          # New Zealand Dollar
+    "6M":   ("CME", "6M"),          # Mexican Peso
+    "MJY":  ("CME_MINI", "MJY"),    # Micro JPY/USD ✓
+    "M6E":  ("CME_MINI", "M6E"),    # Micro Euro FX ✓
+    
+    # ── NYMEX Energy ─────────────────────────────────────────────
+    "CL":   ("NYMEX", "CL"),        # Crude Oil WTI ($1000/pt)
+    "NG":   ("NYMEX", "NG"),        # Natural Gas ($10,000/pt)
+    "HO":   ("NYMEX", "HO"),        # Heating Oil ✓
+    "RB":   ("NYMEX", "RB"),        # RBOB Gasoline ✓
+    "MCL":  ("NYMEX", "MCL"),       # Micro Crude Oil ✓
+    "PA":   ("NYMEX", "PA"),        # Palladium ✓
+    "PL":   ("NYMEX", "PL"),        # Platinum ✓
+    
+    # ── COMEX Metals ─────────────────────────────────────────────
+    "GC":   ("COMEX", "GC"),        # Gold ($100/oz) ✓
+    "SI":   ("COMEX", "SI"),        # Silver ($5000/oz) ✓
+    "HG":   ("COMEX", "HG"),        # Copper ✓
+    "MGC":  ("COMEX_MINI", "MGC"),  # Micro Gold ($10/oz) ✓
+    "SIL":  ("COMEX_MINI", "SIL"),  # Micro Silver ($1000/oz) ✓
+    "MHG":  ("COMEX_MINI", "MHG"),  # Micro Copper ✓
+    
+    # ── CBOT Bonds / Interest Rates ──────────────────────────────
+    "ZB":   ("CBOT", "ZB"),         # 30-Year Treasury Bond
+    "ZN":   ("CBOT", "ZN"),         # 10-Year Treasury Note
+    "ZF":   ("CBOT", "ZF"),         # 5-Year Treasury Note ✓
+    "ZT":   ("CBOT", "ZT"),         # 2-Year Treasury Note ✓
+    "UB":   ("CBOT", "UB"),         # Ultra Treasury Bond ✓
+    "TN":   ("CBOT", "TN"),         # Ultra 10-Year Note ✓
+    
+    # ── CBOT Grains & Agriculture ────────────────────────────────
+    "ZC":   ("CBOT", "ZC"),         # Corn ($50/bu)
+    "ZS":   ("CBOT", "ZS"),         # Soybeans ($50/bu)
+    "ZW":   ("CBOT", "ZW"),         # Wheat ($50/bu)
+    "ZM":   ("CBOT", "ZM"),         # Soybean Meal ✓
+    "ZL":   ("CBOT", "ZL"),         # Soybean Oil ✓
+    "ZO":   ("CBOT", "ZO"),         # Oats ✓
+    "KE":   ("CBOT", "KE"),         # KC HRW Wheat ✓
+    
+    # ── CME Livestock ────────────────────────────────────────────
+    "LE":   ("CME", "LE"),          # Live Cattle ✓
+    "HE":   ("CME", "HE"),          # Lean Hogs ✓
+    "GF":   ("CME", "GF"),          # Feeder Cattle ✓
+    
+    # ── CBOE Volatility ──────────────────────────────────────────
+    "VX":   ("CBOE", "VX"),         # VIX Futures ✓
+}
+
+# NOT available on InsightSentry (tested 2026-03):
+# ZR (Rough Rice), M6A/M6B (Micro AUD/GBP FX), MNG (Micro Nat Gas — untested)
+
+# Contract month codes: F=Jan, G=Feb, H=Mar, J=Apr, K=May, M=Jun,
+#                      N=Jul, Q=Aug, U=Sep, V=Oct, X=Nov, Z=Dec
+ALL_MONTH_CODES = {
+    1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+    7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z',
 }
 
 # Quarterly contract months: H=March, M=June, U=September, Z=December
 CONTRACT_MONTHS = ['H', 'M', 'U', 'Z']
 
-# Which calendar months each contract covers
+# Which calendar months each contract covers (for quarterly products)
 CONTRACT_COVERAGE = {
     'H': [12, 1, 2, 3],   # Dec(prev year), Jan, Feb, Mar
     'M': [3, 4, 5, 6],    # Mar, Apr, May, Jun
     'U': [6, 7, 8, 9],    # Jun, Jul, Aug, Sep
     'Z': [9, 10, 11, 12], # Sep, Oct, Nov, Dec
+}
+
+# Products that use monthly contracts (not quarterly)
+# These roll on a monthly basis — the active contract is typically the next month
+MONTHLY_PRODUCTS = {
+    "CL", "NG", "HO", "RB", "MCL", "MNG",    # Energy
+    "GC", "SI", "HG", "MGC", "SIL", "MHG",    # Metals
+    "PA", "PL",                                  # Precious metals
+    "ZC", "ZS", "ZW", "ZM", "ZL", "ZO", "ZR", "KE",  # Grains
+    "LE", "HE", "GF",                           # Livestock
+    "VX",                                        # Volatility
+    "BTC", "MBT", "ETH", "MET",                 # Crypto
 }
 
 # Interval mapping
@@ -87,19 +158,34 @@ def get_headers(api_key):
 
 
 def get_active_contract(exchange, product, dt):
-    """Determine which contract is active for a given date."""
+    """Determine which contract is active for a given date.
+    
+    Monthly products (CL, GC, etc.): active contract is next month's delivery.
+    Quarterly products (ES, NQ, etc.): active contract is next quarterly expiry.
+    """
     month = dt.month
     year = dt.year
 
-    for contract in CONTRACT_MONTHS:
-        coverage = CONTRACT_COVERAGE[contract]
-        if month in coverage:
-            contract_year = year
-            if contract == 'H' and month == 12:
-                contract_year = year + 1
-            return f"{exchange}:{product}{contract}{contract_year}"
+    if product in MONTHLY_PRODUCTS:
+        # Monthly: active contract is next month (front month)
+        next_month = month + 1
+        next_year = year
+        if next_month > 12:
+            next_month = 1
+            next_year += 1
+        code = ALL_MONTH_CODES[next_month]
+        return f"{exchange}:{product}{code}{next_year}"
+    else:
+        # Quarterly: find next quarterly expiry
+        for contract in CONTRACT_MONTHS:
+            coverage = CONTRACT_COVERAGE[contract]
+            if month in coverage:
+                contract_year = year
+                if contract == 'H' and month == 12:
+                    contract_year = year + 1
+                return f"{exchange}:{product}{contract}{contract_year}"
 
-    return f"{exchange}:{product}H{year}"
+        return f"{exchange}:{product}H{year}"
 
 
 def get_contracts_for_period(exchange, product, start_dt, end_dt):
@@ -195,6 +281,14 @@ def fetch_history_month(api_key, contract_symbol, bar_interval, year, month):
 
         if resp.status_code != 200:
             text = resp.text[:200] if resp.text else ""
+            # HTTP 400 "Invalid Symbol Code" is expected for contract months
+            # that don't exist for this product (e.g., MGC only has certain months)
+            if resp.status_code == 400 and "Invalid Symbol Code" in text:
+                print(f"(no contract)")
+                return []
+            elif resp.status_code == 400 and "No data is available" in text:
+                print(f"(no data)")
+                return []
             print(f"HTTP {resp.status_code}: {text}")
             return []
 
@@ -202,6 +296,9 @@ def fetch_history_month(api_key, contract_symbol, bar_interval, year, month):
 
         if "message" in data or "error" in data:
             msg = data.get("message") or data.get("error")
+            if "Invalid Symbol" in str(msg) or "No data" in str(msg):
+                print(f"(skipped)")
+                return []
             print(f"API error: {msg}")
             return []
 
@@ -254,14 +351,84 @@ def fetch_all_bars(api_key, exchange, product, bar_interval, days_back):
 
 
 # ── Export ──────────────────────────────────────────────────────────
+def filter_maintenance_halt(rows):
+    """Remove bars during CME daily maintenance halt (16:00-17:00 CT).
+    
+    CME futures halt trading from 16:00-17:00 CT (Central Time) every weekday.
+    TradingView doesn't show bars during this period. Removing them from our
+    data ensures indicator lookbacks (ATR, highest/lowest, SMA) use the same
+    bars as TV, preventing divergence in stops, targets, and trailing exits.
+    
+    Also removes weekend bars (Saturday 00:00 - Sunday 17:00 CT).
+    """
+    from datetime import datetime, timezone, timedelta
+    
+    filtered = []
+    removed = 0
+    
+    for row in rows:
+        ts_ms = row[0]
+        ts_s = ts_ms / 1000
+        
+        dt_utc = datetime.fromtimestamp(ts_s, tz=timezone.utc)
+        year = dt_utc.year
+        
+        # DST check: 2nd Sunday of March to 1st Sunday of November
+        mar1 = datetime(year, 3, 1, tzinfo=timezone.utc)
+        mar_sun2 = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7)
+        nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+        nov_sun1 = nov1 + timedelta(days=(6 - nov1.weekday()) % 7)
+        is_dst = mar_sun2 <= dt_utc < nov_sun1
+        ct_offset = timedelta(hours=-5 if is_dst else -6)
+        dt_ct = dt_utc + ct_offset
+        
+        ct_hour = dt_ct.hour
+        ct_minute = dt_ct.minute
+        ct_weekday = dt_ct.weekday()  # 0=Mon, 5=Sat, 6=Sun
+        
+        # Skip maintenance halt: 16:00-16:59 CT (bar at 16:00 through 16:55)
+        if ct_hour == 16:
+            removed += 1
+            continue
+        
+        # Skip weekend: Saturday all day + Sunday before 17:00 CT
+        # CME Globex reopens Sunday 17:00 CT
+        if ct_weekday == 5:  # Saturday
+            removed += 1
+            continue
+        if ct_weekday == 6 and ct_hour < 17:  # Sunday before 17:00
+            removed += 1
+            continue
+        
+        # Skip Friday after 16:00 CT (market closed for weekend)
+        if ct_weekday == 4 and ct_hour >= 16:
+            removed += 1
+            continue
+        
+        filtered.append(row)
+    
+    if removed > 0:
+        print(f"  Filtered {removed} maintenance halt/weekend bars ({len(filtered)} remaining)")
+    
+    return filtered
+
+
 def export_csv(rows, symbol, interval, days, output_dir="."):
-    """Export to backtester format: timestamp(unix ms),open,high,low,close,volume"""
+    """Export to backtester format: timestamp(unix ms),open,high,low,close,volume
+    
+    Automatically filters out CME maintenance halt bars (16:00-17:00 CT)
+    so the bar stream matches TradingView's chart data.
+    """
+    # Filter maintenance halt bars before export
+    clean_rows = filter_maintenance_halt(rows)
+    
     filename = f"{symbol}_{interval}_{days}d_bt.csv"
     filepath = os.path.join(output_dir, filename)
+    os.makedirs(output_dir, exist_ok=True)
     with open(filepath, "w") as f:
-        for ts, o, h, l, c, v in rows:
+        for ts, o, h, l, c, v in clean_rows:
             f.write(f"{ts},{o},{h},{l},{c},{v}\n")
-    print(f"\nExported {len(rows)} bars -> {filepath}")
+    print(f"\nExported {len(clean_rows)} bars -> {filepath}")
     return filepath
 
 
@@ -269,7 +436,17 @@ def export_csv(rows, symbol, interval, days, output_dir="."):
 def main():
     if len(sys.argv) < 4:
         print("Usage: python futures_fetcher.py <SYMBOL> <INTERVAL> <DAYS> [export|csv]")
-        print("\nSymbols: " + ", ".join(sorted(SYMBOL_MAP.keys())))
+        print("\nSymbols by category:")
+        categories = {}
+        for sym, (exch, prod) in sorted(SYMBOL_MAP.items()):
+            cat = exch.replace("CME_MINI", "CME Equity")
+            if sym in ("BTC","MBT","ETH","MET"): cat = "CME Crypto"
+            elif sym.startswith("6") or sym.startswith("M6") or sym == "MJY": cat = "CME FX"
+            elif exch == "CME" and sym in ("LE","HE","GF"): cat = "CME Livestock"
+            categories.setdefault(cat, []).append(sym)
+        for cat in sorted(categories):
+            print(f"  {cat}: {', '.join(sorted(categories[cat]))}")
+        print(f"\n  Total: {len(SYMBOL_MAP)} symbols")
         print("Intervals: " + ", ".join(INTERVAL_MAP.keys()))
         print("\nExamples:")
         print("  python futures_fetcher.py ES 5m 365")
@@ -341,7 +518,10 @@ def main():
 
     # Query result
     rows = get_cached_bars(conn, symbol_key, interval, start_ts, now_ts)
-    print(f"\nAvailable: {len(rows)} bars")
+    print(f"\nAvailable: {len(rows)} bars (raw)")
+
+    # Filter maintenance halt bars (16:00-17:00 CT) to match TradingView
+    rows = filter_maintenance_halt(rows)
 
     if rows:
         first_dt = datetime.fromtimestamp(rows[0][0] / 1000, tz=timezone.utc)

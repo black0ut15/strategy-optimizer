@@ -301,6 +301,21 @@ def main():
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(python_code)
             
+            # Run post-translation validator
+            validation_info = ""
+            try:
+                from validate_translation import validate_and_fix
+                vresult = validate_and_fix(filepath, auto_fix=True)
+                if vresult.fixes_applied:
+                    validation_info += f"Auto-fixed {len(vresult.fixes_applied)} issues: " + "; ".join(vresult.fixes_applied)
+                    # Re-read the fixed file
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        python_code = f.read()
+                if vresult.warnings:
+                    validation_info += (" | " if validation_info else "") + f"Warnings: " + "; ".join(vresult.warnings)
+            except Exception as ve:
+                validation_info = f"Validator error: {ve}"
+            
             output = {
                 "success": True,
                 "name": name,
@@ -308,6 +323,7 @@ def main():
                 "filepath": filepath,
                 "code": python_code,
                 "lines": len(python_code.splitlines()),
+                "validation": validation_info,
             }
             sys.stdout.write(json.dumps(output))
         except Exception as e:
@@ -343,6 +359,18 @@ def main():
         
         print(f"Saved {len(python_code.splitlines())} lines -> {filepath}")
         print(f"Class: {_to_class_name(name)}")
+        
+        # Run post-translation validator
+        try:
+            from validate_translation import validate_and_fix
+            print(f"\nRunning post-translation validator...")
+            vresult = validate_and_fix(filepath, auto_fix=True)
+            print(vresult.summary())
+            if vresult.fixes_applied:
+                print(f"\n  File updated with {len(vresult.fixes_applied)} auto-fixes.")
+        except Exception as ve:
+            print(f"\nValidator error: {ve}")
+        
         print(f"\nTo test: python -c \"from strategies.{name} import {_to_class_name(name)}; print('OK')\"")
 
 

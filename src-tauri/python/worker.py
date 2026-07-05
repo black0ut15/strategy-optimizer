@@ -62,6 +62,20 @@ class WorkerState:
         self.results: list = []
         self.elapsed: float = 0.0
         self.error: str = ""
+        
+        # Heartbeat — coordinator polls /status every ~2s
+        self.last_poll_time: float = time.time()
+        self.heartbeat_timeout: float = 60.0  # seconds
+        self._sweep_thread: Optional[threading.Thread] = None
+        self._pool = None  # multiprocessing.Pool ref for forced termination
+
+    def touch(self):
+        """Update last poll time (called on any coordinator request)."""
+        self.last_poll_time = time.time()
+
+    def is_coordinator_alive(self) -> bool:
+        """Check if coordinator has polled recently."""
+        return (time.time() - self.last_poll_time) < self.heartbeat_timeout
 
     def progress_pct(self) -> float:
         if self.total_combos == 0:
@@ -72,6 +86,12 @@ class WorkerState:
         if self.error:
             return "error"
         if self.running:
+            # Check if sweep thread is actually alive
+            if self._sweep_thread is not None and not self._sweep_thread.is_alive():
+                self.running = False
+                if not self.error:
+                    self.error = "Sweep thread died unexpectedly"
+                return "error"
             return "running"
         if len(self.results) > 0:
             return "done"
@@ -84,9 +104,10 @@ STATE: Optional[WorkerState] = None
 # ── Sweep Runner ─────────────────────────────────────────────────
 
 def run_sweep_chunk(state: WorkerState, config: dict, chunk_start: int, chunk_end: int):
-    """Run a subset of the parameter grid."""
+    """Run a subset of the parameter grid using multiprocessing."""
     try:
-        from sweep import build_param_grid, _resolve_strategy
+        from sweep import build_param_grid, _resolve_strategy, _worker_init, _worker_run
+        import multiprocessing as mp
         
         settings = config.get("sweep_settings", {})
         fee_pct = settings.get("fee_pct", 0.035)
@@ -96,6 +117,36 @@ def run_sweep_chunk(state: WorkerState, config: dict, chunk_start: int, chunk_en
         calc_on_order_fills = settings.get("calc_on_order_fills", True)
         min_trades = settings.get("min_trades", 0)
         max_dd_pct = settings.get("max_dd_pct", 100.0)
+        contract_value = settings.get("contract_value", 1.0)
+        
+        # Load blocked dates
+        blocked_categories = settings.get("blocked_date_categories", [])
+        blocked_dates = set()
+        all_category_dates = {}
+        
+        import json as _json
+        for candidate in [
+            os.path.join(SCRIPT_DIR, "blocked_dates.json"),
+            os.path.join(os.environ.get("APPDATA", ""), "StrategyOptimizer", "blocked_dates.json"),
+        ]:
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate) as f:
+                        all_category_dates = _json.load(f)
+                    for cat in blocked_categories:
+                        if cat in all_category_dates:
+                            blocked_dates.update(all_category_dates[cat])
+                    if blocked_dates:
+                        print(f"  Blocked dates (always-on): {len(blocked_dates)} from {candidate}")
+                except Exception as e:
+                    print(f"  Warning: Failed to load blocked_dates.json: {e}")
+                break
+        
+        # Set blocked dates in parent process (subprocesses get them via _worker_init)
+        from sweep import _worker_set_blocked_dates, _worker_set_all_category_dates
+        _worker_set_blocked_dates(blocked_dates)
+        _worker_set_all_category_dates(all_category_dates)
+        blocked_categories = settings.get("blocked_date_categories", [])
         
         # Build full parameter grid, then slice our chunk
         strategy_class = _resolve_strategy(state.strategy_name)
@@ -111,44 +162,73 @@ def run_sweep_chunk(state: WorkerState, config: dict, chunk_start: int, chunk_en
         state.results = []
         state.error = ""
         
-        print(f"  Running chunk [{chunk_start}..{chunk_end}] = {total} combos")
+        num_workers = max(1, mp.cpu_count())
+        print(f"  Running chunk [{chunk_start}..{chunk_end}] = {total} combos on {num_workers} cores")
         
         t0 = time.time()
         results = []
         
-        for i, params in enumerate(our_grid):
-            if state.should_stop:
-                print("  Sweep stopped by coordinator")
-                break
-            
-            strategy = strategy_class()
-            stats = BacktestEngine.run_fast(
-                strategy, state.bars, params,
-                initial_capital=initial_capital,
-                fee_pct=fee_pct,
-                warmup_bars=warmup_bars,
-                fill_on_bar_close=fill_on_bar_close,
-                calc_on_order_fills=calc_on_order_fills,
+        # Save bars to temp CSV for multiprocessing workers
+        import tempfile
+        bars_csv = os.path.join(tempfile.gettempdir(), "worker_bars.csv")
+        with open(bars_csv, "w") as f:
+            f.write("timestamp,open,high,low,close,volume\n")
+            for j in range(len(state.bars)):
+                f.write(f"{state.bars.timestamp[j]},{state.bars.open[j]},{state.bars.high[j]},{state.bars.low[j]},{state.bars.close[j]},{state.bars.volume[j]}\n")
+        
+        # Serialize category dates for subprocess passing
+        import json as _json2
+        all_cat_dates_json = _json2.dumps(all_category_dates) if all_category_dates else "{}"
+        
+        # Prepare work items
+        work_items = [(params, fee_pct, initial_capital, warmup_bars,
+                       fill_on_bar_close, calc_on_order_fills, contract_value) for params in our_grid]
+        
+        if total <= 4 or num_workers <= 1:
+            # Small grid — run in-process
+            _worker_init(bars_csv, state.strategy_name, blocked_categories, all_cat_dates_json)
+            for idx, item in enumerate(work_items):
+                if state.should_stop or not state.is_coordinator_alive():
+                    if not state.is_coordinator_alive():
+                        print("  Coordinator heartbeat lost — stopping sweep")
+                        state.error = "Coordinator disconnected"
+                    break
+                r = _worker_run(item)
+                if r is not None:
+                    if r.get("trades", 0) >= min_trades and r.get("dd_pct", 0) <= max_dd_pct:
+                        results.append(r)
+                state.completed = idx + 1
+        else:
+            # Parallel execution
+            pool = mp.Pool(
+                processes=num_workers,
+                initializer=_worker_init,
+                initargs=(bars_csv, state.strategy_name, blocked_categories, all_cat_dates_json),
             )
-            
-            state.completed = i + 1
-            
-            if stats.total_trades < min_trades:
-                continue
-            if stats.max_drawdown_pct > max_dd_pct:
-                continue
-            
-            results.append({
-                "params": params,
-                "pf": round(stats.profit_factor, 4),
-                "net": round(stats.net_profit, 2),
-                "dd": round(stats.max_drawdown, 2),
-                "dd_pct": round(stats.max_drawdown_pct, 2),
-                "wr": round(stats.win_rate, 1),
-                "trades": stats.total_trades,
-                "gross_profit": round(stats.gross_profit, 2),
-                "gross_loss": round(stats.gross_loss, 2),
-            })
+            state._pool = pool  # Store ref so /reset can terminate it
+            try:
+                chunksize = max(1, min(10, total // (num_workers * 10)))
+                for r in pool.imap_unordered(_worker_run, work_items, chunksize=chunksize):
+                    if state.should_stop or not state.is_coordinator_alive():
+                        if not state.is_coordinator_alive():
+                            print("  Coordinator heartbeat lost — stopping sweep")
+                            state.error = "Coordinator disconnected"
+                        pool.terminate()
+                        pool.join()
+                        break
+                    state.completed += 1
+                    if r is not None:
+                        if r.get("trades", 0) >= min_trades and r.get("dd_pct", 0) <= max_dd_pct:
+                            results.append(r)
+                else:
+                    pool.close()
+                    pool.join()
+            except Exception:
+                pool.terminate()
+                pool.join()
+                raise
+            finally:
+                state._pool = None
         
         elapsed = time.time() - t0
         rate = total / max(elapsed, 0.001)
@@ -184,7 +264,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", len(body))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass
     
     def _read_body(self) -> str:
         length = int(self.headers.get("Content-Length", 0))
@@ -196,6 +279,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self._send_json(200, {})
     
     def do_GET(self):
+        STATE.touch()
         if self.path == "/health":
             self._send_json(200, {
                 "status": "ok",
@@ -225,10 +309,43 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "elapsed": round(STATE.elapsed, 1),
             })
         
+        elif self.path == "/reset":
+            # Allow GET /reset for easy browser-bar access
+            STATE.should_stop = True
+            if STATE._pool is not None:
+                try:
+                    STATE._pool.terminate()
+                    STATE._pool.join()
+                except Exception:
+                    pass
+                STATE._pool = None
+            STATE.running = False
+            STATE.results = []
+            STATE.completed = 0
+            STATE.total_combos = 0
+            STATE.elapsed = 0.0
+            STATE.error = ""
+            STATE._sweep_thread = None
+            print("  Worker reset via GET")
+            self._send_json(200, {"reset": True})
+        
+        elif self.path == "/stop":
+            # Allow GET /stop for easy browser-bar access
+            STATE.should_stop = True
+            print("  Worker stop via GET")
+            self._send_json(200, {"stopped": True})
+        
+        elif self.path == "/grid-size":
+            if not STATE.strategy_name:
+                self._send_json(400, {"error": "No strategy loaded"})
+            else:
+                self._send_json(200, {"grid_size": 0, "error": "Use /grid-size as POST with config"})
+        
         else:
             self._send_json(404, {"error": f"Unknown endpoint: {self.path}"})
     
     def do_POST(self):
+        STATE.touch()
         body = self._read_body()
         
         if self.path == "/load-data":
@@ -269,24 +386,29 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 # If code provided, save to a worker-specific temp strategies dir
                 # (avoid overwriting source files which can trigger Tauri dev rebuilds)
                 if code:
-                    import tempfile
-                    worker_strategies_dir = os.path.join(tempfile.gettempdir(), "strategy_optimizer_worker", "strategies")
-                    os.makedirs(worker_strategies_dir, exist_ok=True)
-                    filepath = os.path.join(worker_strategies_dir, f"{name}.py")
+                    # Save directly to our local strategies/ directory
+                    local_strategies_dir = os.path.join(SCRIPT_DIR, "strategies")
+                    os.makedirs(local_strategies_dir, exist_ok=True)
+                    # Ensure __init__.py exists
+                    init_path = os.path.join(local_strategies_dir, "__init__.py")
+                    if not os.path.exists(init_path):
+                        with open(init_path, "w") as f:
+                            f.write("")
+                    filepath = os.path.join(local_strategies_dir, f"{name}.py")
                     with open(filepath, "w", encoding="utf-8") as f:
                         f.write(code)
-                    # Add temp dir to Python path so import can find it
-                    parent = os.path.join(tempfile.gettempdir(), "strategy_optimizer_worker")
-                    if parent not in sys.path:
-                        sys.path.insert(0, parent)
                     print(f"  Saved strategy: {filepath}")
                     
-                    # Reload module if already imported
-                    mod_name = f"strategies.{name}"
-                    if mod_name in sys.modules:
-                        del sys.modules[mod_name]
+                    # Clear ALL cached strategy modules to force fresh import
+                    for key in list(sys.modules.keys()):
+                        if key.startswith("strategies"):
+                            del sys.modules[key]
                 
                 # Verify we can import it
+                # Clear cache first
+                for key in list(sys.modules.keys()):
+                    if key.startswith("strategies"):
+                        del sys.modules[key]
                 mod = importlib.import_module(f"strategies.{name}")
                 # Use MRO name check to handle cross-path import identity issues
                 for attr_name in dir(mod):
@@ -336,6 +458,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     args=(STATE, config, chunk_start, chunk_end),
                     daemon=True,
                 )
+                STATE._sweep_thread = thread
                 thread.start()
                 
                 self._send_json(200, {
@@ -350,6 +473,39 @@ class WorkerHandler(BaseHTTPRequestHandler):
         elif self.path == "/stop":
             STATE.should_stop = True
             self._send_json(200, {"stopped": True})
+        
+        elif self.path == "/reset":
+            STATE.should_stop = True
+            # Terminate multiprocessing pool if running
+            if STATE._pool is not None:
+                try:
+                    STATE._pool.terminate()
+                    STATE._pool.join()
+                except Exception:
+                    pass
+                STATE._pool = None
+            STATE.running = False
+            STATE.results = []
+            STATE.completed = 0
+            STATE.total_combos = 0
+            STATE.elapsed = 0.0
+            STATE.error = ""
+            STATE._sweep_thread = None
+            print("  Worker reset by coordinator")
+            self._send_json(200, {"reset": True})
+        
+        elif self.path == "/grid-size":
+            # Return actual grid size for a config (avoids JS/Python combo count mismatch)
+            try:
+                from sweep import build_param_grid, _resolve_strategy
+                payload = json.loads(body)
+                config = payload.get("config", payload)
+                strategy_class = _resolve_strategy(STATE.strategy_name)
+                param_names, grid = build_param_grid(config.get("parameters", {}), strategy_class)
+                print(f"  Grid size query: {len(grid)} combos")
+                self._send_json(200, {"grid_size": len(grid)})
+            except Exception as e:
+                self._send_json(400, {"error": f"Grid size error: {e}"})
         
         else:
             self._send_json(404, {"error": f"Unknown endpoint: {self.path}"})
@@ -394,10 +550,13 @@ def main():
     print("  Endpoints:")
     print("    GET  /health        -- liveness check")
     print("    GET  /status        -- progress & stats")
+    print("    GET  /results       -- retrieve results")
+    print("    GET  /reset         -- abort & clear sweep")
+    print("    GET  /stop          -- abort current sweep")
     print("    POST /load-data     -- send CSV bar data")
     print("    POST /load-strategy -- send strategy .py")
     print("    POST /sweep         -- start sweep chunk")
-    print("    GET  /results       -- retrieve results")
+    print("    POST /reset         -- abort & clear sweep")
     print("    POST /stop          -- abort current sweep")
     print("=" * 50)
     print()

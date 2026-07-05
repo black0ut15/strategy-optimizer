@@ -341,3 +341,492 @@ def _gz(arr: np.ndarray, idx: int) -> float:
     if idx < 0 or idx >= len(arr) or np.isnan(arr[idx]):
         return 0.0
     return arr[idx]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Additional indicators — matches TradingView Pine Script ta.* functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def rsi(source: np.ndarray, length: int) -> np.ndarray:
+    """Relative Strength Index matching TradingView's ta.rsi."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    if n < length + 1 or length < 1:
+        return result
+
+    delta = np.diff(source, prepend=np.nan)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+
+    avg_gain = rma(gain, length)
+    avg_loss = rma(loss, length)
+
+    for i in range(n):
+        if np.isnan(avg_gain[i]) or np.isnan(avg_loss[i]):
+            continue
+        if avg_loss[i] == 0:
+            result[i] = 100.0
+        else:
+            rs = avg_gain[i] / avg_loss[i]
+            result[i] = 100.0 - (100.0 / (1.0 + rs))
+    return result
+
+
+def macd(source: np.ndarray, fast_length: int = 12, slow_length: int = 26,
+         signal_length: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """MACD matching TradingView's ta.macd. Returns (macd_line, signal_line, histogram)."""
+    fast_ema = ema(source, fast_length)
+    slow_ema = ema(source, slow_length)
+    macd_line = fast_ema - slow_ema
+    signal_line = ema(macd_line, signal_length)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def stoch(close: np.ndarray, high: np.ndarray, low: np.ndarray,
+          length: int) -> np.ndarray:
+    """Stochastic %K matching TradingView's ta.stoch."""
+    n = len(close)
+    result = np.full(n, np.nan)
+    if n < length:
+        return result
+    for i in range(length - 1, n):
+        hh = np.max(high[i - length + 1:i + 1])
+        ll = np.min(low[i - length + 1:i + 1])
+        if hh != ll:
+            result[i] = (close[i] - ll) / (hh - ll) * 100.0
+        else:
+            result[i] = 50.0
+    return result
+
+
+def bb(source: np.ndarray, length: int, mult: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bollinger Bands matching TradingView's ta.bb. Returns (middle, upper, lower)."""
+    middle = sma(source, length)
+    std = stdev(source, length)
+    upper = middle + mult * std
+    lower = middle - mult * std
+    return middle, upper, lower
+
+
+def bbw(source: np.ndarray, length: int, mult: float = 2.0) -> np.ndarray:
+    """Bollinger Band Width matching TradingView's ta.bbw."""
+    middle, upper, lower = bb(source, length, mult)
+    result = np.full(len(source), np.nan)
+    valid = ~np.isnan(middle) & (middle != 0)
+    result[valid] = (upper[valid] - lower[valid]) / middle[valid]
+    return result
+
+
+def cci(high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int) -> np.ndarray:
+    """Commodity Channel Index matching TradingView's ta.cci."""
+    tp = (high + low + close) / 3.0
+    tp_sma = sma(tp, length)
+    n = len(close)
+    result = np.full(n, np.nan)
+    for i in range(length - 1, n):
+        mean_dev = np.mean(np.abs(tp[i - length + 1:i + 1] - tp_sma[i]))
+        if mean_dev != 0:
+            result[i] = (tp[i] - tp_sma[i]) / (0.015 * mean_dev)
+        else:
+            result[i] = 0.0
+    return result
+
+
+def wma(source: np.ndarray, length: int) -> np.ndarray:
+    """Weighted Moving Average matching TradingView's ta.wma."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    if n < length or length < 1:
+        return result
+    weights = np.arange(1, length + 1, dtype=float)
+    weight_sum = weights.sum()
+    for i in range(length - 1, n):
+        result[i] = np.sum(source[i - length + 1:i + 1] * weights) / weight_sum
+    return result
+
+
+def vwma(source: np.ndarray, volume: np.ndarray, length: int) -> np.ndarray:
+    """Volume Weighted Moving Average matching TradingView's ta.vwma."""
+    sv = source * volume
+    return sma(sv, length) / sma(volume, length)
+
+
+def hma(source: np.ndarray, length: int) -> np.ndarray:
+    """Hull Moving Average matching TradingView's ta.hma."""
+    import math
+    half = max(1, length // 2)
+    sqr = max(1, int(math.sqrt(length)))
+    wma_half = wma(source, half)
+    wma_full = wma(source, length)
+    diff = 2.0 * wma_half - wma_full
+    return wma(diff, sqr)
+
+
+def dema(source: np.ndarray, length: int) -> np.ndarray:
+    """Double Exponential Moving Average."""
+    e1 = ema(source, length)
+    e2 = ema(e1, length)
+    return 2.0 * e1 - e2
+
+
+def tema(source: np.ndarray, length: int) -> np.ndarray:
+    """Triple Exponential Moving Average."""
+    e1 = ema(source, length)
+    e2 = ema(e1, length)
+    e3 = ema(e2, length)
+    return 3.0 * e1 - 3.0 * e2 + e3
+
+
+def tr(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
+    """True Range matching TradingView's ta.tr."""
+    n = len(close)
+    result = np.full(n, np.nan)
+    result[0] = high[0] - low[0]
+    for i in range(1, n):
+        result[i] = max(
+            high[i] - low[i],
+            abs(high[i] - close[i - 1]),
+            abs(low[i] - close[i - 1])
+        )
+    return result
+
+
+def highest(source: np.ndarray, length: int) -> np.ndarray:
+    """Highest value over last N bars matching TradingView's ta.highest."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    for i in range(length - 1, n):
+        result[i] = np.nanmax(source[i - length + 1:i + 1])
+    return result
+
+
+def lowest(source: np.ndarray, length: int) -> np.ndarray:
+    """Lowest value over last N bars matching TradingView's ta.lowest."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    for i in range(length - 1, n):
+        result[i] = np.nanmin(source[i - length + 1:i + 1])
+    return result
+
+
+def highestbars(source: np.ndarray, length: int) -> np.ndarray:
+    """Bars since highest value matching TradingView's ta.highestbars (returns negative offset)."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    for i in range(length - 1, n):
+        window = source[i - length + 1:i + 1]
+        idx = np.nanargmax(window)
+        result[i] = idx - (length - 1)  # negative offset
+    return result
+
+
+def lowestbars(source: np.ndarray, length: int) -> np.ndarray:
+    """Bars since lowest value matching TradingView's ta.lowestbars (returns negative offset)."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    for i in range(length - 1, n):
+        window = source[i - length + 1:i + 1]
+        idx = np.nanargmin(window)
+        result[i] = idx - (length - 1)  # negative offset
+    return result
+
+
+def stdev(source: np.ndarray, length: int) -> np.ndarray:
+    """Standard deviation matching TradingView's ta.stdev."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    if n < length or length < 1:
+        return result
+    for i in range(length - 1, n):
+        result[i] = np.std(source[i - length + 1:i + 1], ddof=0)
+    return result
+
+
+def variance(source: np.ndarray, length: int) -> np.ndarray:
+    """Variance matching TradingView's ta.variance."""
+    sd = stdev(source, length)
+    return sd ** 2
+
+
+def change(source: np.ndarray, length: int = 1) -> np.ndarray:
+    """Change matching TradingView's ta.change."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    for i in range(length, n):
+        result[i] = source[i] - source[i - length]
+    return result
+
+
+def mom(source: np.ndarray, length: int) -> np.ndarray:
+    """Momentum matching TradingView's ta.mom (same as change)."""
+    return change(source, length)
+
+
+def roc(source: np.ndarray, length: int) -> np.ndarray:
+    """Rate of Change matching TradingView's ta.roc."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    for i in range(length, n):
+        if source[i - length] != 0:
+            result[i] = (source[i] - source[i - length]) / source[i - length] * 100.0
+    return result
+
+
+def mfi(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+        volume: np.ndarray, length: int) -> np.ndarray:
+    """Money Flow Index matching TradingView's ta.mfi."""
+    n = len(close)
+    result = np.full(n, np.nan)
+    tp = (high + low + close) / 3.0
+    mf = tp * volume
+
+    pos_mf = np.zeros(n)
+    neg_mf = np.zeros(n)
+    for i in range(1, n):
+        if tp[i] > tp[i - 1]:
+            pos_mf[i] = mf[i]
+        elif tp[i] < tp[i - 1]:
+            neg_mf[i] = mf[i]
+
+    for i in range(length, n):
+        pmf = np.sum(pos_mf[i - length + 1:i + 1])
+        nmf = np.sum(neg_mf[i - length + 1:i + 1])
+        if nmf == 0:
+            result[i] = 100.0
+        else:
+            result[i] = 100.0 - (100.0 / (1.0 + pmf / nmf))
+    return result
+
+
+def obv(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+    """On Balance Volume matching TradingView's ta.obv."""
+    n = len(close)
+    result = np.zeros(n)
+    for i in range(1, n):
+        if close[i] > close[i - 1]:
+            result[i] = result[i - 1] + volume[i]
+        elif close[i] < close[i - 1]:
+            result[i] = result[i - 1] - volume[i]
+        else:
+            result[i] = result[i - 1]
+    return result
+
+
+def vwap(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+         volume: np.ndarray, timestamps: np.ndarray = None,
+         session_reset: bool = True) -> np.ndarray:
+    """VWAP with optional session reset matching TradingView's ta.vwap.
+    
+    Args:
+        high, low, close, volume: OHLCV arrays.
+        timestamps: Unix timestamps (seconds or milliseconds). Required for session reset.
+        session_reset: If True and timestamps provided, reset VWAP at each new trading day.
+                      If False or no timestamps, compute cumulative VWAP from bar 0.
+    
+    TradingView's ta.vwap resets at the start of each session (new day for daily charts,
+    new day in the instrument's exchange timezone for intraday charts).
+    """
+    n = len(close)
+    tp = (high + low + close) / 3.0
+    result = np.full(n, np.nan)
+    
+    if not session_reset or timestamps is None:
+        # Cumulative VWAP (no reset)
+        cum_tpv = np.cumsum(tp * volume)
+        cum_vol = np.cumsum(volume)
+        valid = cum_vol > 0
+        result[valid] = cum_tpv[valid] / cum_vol[valid]
+        return result
+    
+    # Session-reset VWAP: detect new days from timestamps
+    from datetime import datetime, timezone, timedelta
+    
+    cum_tpv = 0.0
+    cum_vol = 0.0
+    prev_date = ""
+    
+    for i in range(n):
+        ts = timestamps[i]
+        if ts > 1e12:
+            ts = ts / 1000  # ms to seconds
+        
+        # Convert to exchange timezone (CT for CME futures, UTC fallback)
+        # Use CT (Central Time) — UTC-6 (CST) or UTC-5 (CDT)
+        dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+        year = dt_utc.year
+        
+        # DST check: 2nd Sunday of March to 1st Sunday of November
+        mar1 = datetime(year, 3, 1, tzinfo=timezone.utc)
+        mar_sun2 = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7)
+        nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+        nov_sun1 = nov1 + timedelta(days=(6 - nov1.weekday()) % 7)
+        is_dst = mar_sun2 <= dt_utc < nov_sun1
+        ct_offset = timedelta(hours=-5 if is_dst else -6)
+        dt_ct = dt_utc + ct_offset
+        
+        # Use CT date for session detection
+        # CME Globex session starts at 17:00 CT (previous calendar day's evening)
+        # So a bar at 17:00 CT Monday = start of Tuesday's session
+        # Shift by +7 hours so 17:00 CT -> midnight = new "session day"
+        session_dt = dt_ct + timedelta(hours=7)
+        cur_date = session_dt.strftime("%Y-%m-%d")
+        
+        # Reset on new session day
+        if cur_date != prev_date:
+            cum_tpv = 0.0
+            cum_vol = 0.0
+            prev_date = cur_date
+        
+        cum_tpv += tp[i] * volume[i]
+        cum_vol += volume[i]
+        
+        if cum_vol > 0:
+            result[i] = cum_tpv / cum_vol
+    
+    return result
+
+
+def linreg(source: np.ndarray, length: int, offset: int = 0) -> np.ndarray:
+    """Linear Regression matching TradingView's ta.linreg."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    if n < length:
+        return result
+    x = np.arange(length, dtype=float)
+    for i in range(length - 1, n):
+        y = source[i - length + 1:i + 1]
+        if np.any(np.isnan(y)):
+            continue
+        slope = (length * np.sum(x * y) - np.sum(x) * np.sum(y)) / \
+                (length * np.sum(x * x) - np.sum(x) ** 2)
+        intercept = (np.sum(y) - slope * np.sum(x)) / length
+        result[i] = intercept + slope * (length - 1 - offset)
+    return result
+
+
+def cum(source: np.ndarray) -> np.ndarray:
+    """Cumulative sum matching TradingView's ta.cum."""
+    return np.nancumsum(source)
+
+
+def rising(source: np.ndarray, length: int) -> np.ndarray:
+    """True if source has been rising for length bars. Matches ta.rising."""
+    n = len(source)
+    result = np.zeros(n, dtype=bool)
+    for i in range(length, n):
+        result[i] = all(source[i - j] > source[i - j - 1] for j in range(length))
+    return result
+
+
+def falling(source: np.ndarray, length: int) -> np.ndarray:
+    """True if source has been falling for length bars. Matches ta.falling."""
+    n = len(source)
+    result = np.zeros(n, dtype=bool)
+    for i in range(length, n):
+        result[i] = all(source[i - j] < source[i - j - 1] for j in range(length))
+    return result
+
+
+def barssince(condition: np.ndarray) -> np.ndarray:
+    """Bars since condition was last true. Matches ta.barssince."""
+    n = len(condition)
+    result = np.full(n, np.nan)
+    last_true = -1
+    for i in range(n):
+        if condition[i]:
+            last_true = i
+        if last_true >= 0:
+            result[i] = i - last_true
+    return result
+
+
+def valuewhen(condition: np.ndarray, source: np.ndarray, occurrence: int = 0) -> np.ndarray:
+    """Value of source when condition was last true. Matches ta.valuewhen."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    history = []
+    for i in range(n):
+        if condition[i]:
+            history.append(source[i])
+        if len(history) > occurrence:
+            result[i] = history[-(occurrence + 1)]
+    return result
+
+
+def swma(source: np.ndarray) -> np.ndarray:
+    """Symmetrically Weighted Moving Average (4-bar). Matches ta.swma."""
+    n = len(source)
+    result = np.full(n, np.nan)
+    for i in range(3, n):
+        result[i] = (source[i - 3] + 2 * source[i - 2] + 2 * source[i - 1] + source[i]) / 6.0
+    return result
+
+
+def kc(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+       length: int, mult: float = 1.5, use_tr: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Keltner Channel matching TradingView's ta.kc. Returns (middle, upper, lower)."""
+    middle = ema(close, length)
+    if use_tr:
+        r = atr(high, low, close, length)
+    else:
+        r = rma(high - low, length)
+    upper = middle + mult * r
+    lower = middle - mult * r
+    return middle, upper, lower
+
+
+def donchian(high: np.ndarray, low: np.ndarray, length: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Donchian Channel. Returns (upper, lower, middle)."""
+    upper = highest(high, length)
+    lower = lowest(low, length)
+    middle = (upper + lower) / 2.0
+    return upper, lower, middle
+
+
+def supertrend(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+               length: int, factor: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Supertrend indicator. Returns (supertrend_line, direction)."""
+    n = len(close)
+    atr_val = atr(high, low, close, length)
+
+    upper_band = np.full(n, np.nan)
+    lower_band = np.full(n, np.nan)
+    supertrend_arr = np.full(n, np.nan)
+    direction = np.ones(n)  # 1 = up, -1 = down
+
+    hl2 = (high + low) / 2.0
+
+    for i in range(length, n):
+        if np.isnan(atr_val[i]):
+            continue
+        basic_upper = hl2[i] + factor * atr_val[i]
+        basic_lower = hl2[i] - factor * atr_val[i]
+
+        if i == length or np.isnan(upper_band[i - 1]):
+            upper_band[i] = basic_upper
+            lower_band[i] = basic_lower
+        else:
+            upper_band[i] = basic_upper if basic_upper < upper_band[i - 1] or close[i - 1] > upper_band[i - 1] else upper_band[i - 1]
+            lower_band[i] = basic_lower if basic_lower > lower_band[i - 1] or close[i - 1] < lower_band[i - 1] else lower_band[i - 1]
+
+        if i == length or np.isnan(supertrend_arr[i - 1]):
+            supertrend_arr[i] = upper_band[i]
+            direction[i] = -1
+        elif supertrend_arr[i - 1] == upper_band[i - 1]:
+            if close[i] > upper_band[i]:
+                supertrend_arr[i] = lower_band[i]
+                direction[i] = 1
+            else:
+                supertrend_arr[i] = upper_band[i]
+                direction[i] = -1
+        else:
+            if close[i] < lower_band[i]:
+                supertrend_arr[i] = upper_band[i]
+                direction[i] = -1
+            else:
+                supertrend_arr[i] = lower_band[i]
+                direction[i] = 1
+
+    return supertrend_arr, direction
+

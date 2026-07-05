@@ -21,7 +21,7 @@ Config JSON format (same as frontend generates):
     "sort_by": "pf",
     "min_trades": 0,
     "max_dd_pct": 100.0,
-    "warmup_bars": 0
+    "warmup_bars": 500
   }
 }
 """
@@ -129,25 +129,75 @@ def build_param_grid(
 # Worker function (runs in subprocess via multiprocessing)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _worker_init(bars_path: str, strategy_name: str):
+def _worker_init(bars_path: str, strategy_name: str, always_on_cats: list = None, all_cat_dates_json: str = "{}"):
     """Initialize worker process — load data once per process."""
-    global _worker_bars, _worker_strategy_class
+    global _worker_bars, _worker_strategy_class, _worker_all_category_dates, _worker_blocked_dates, _worker_always_on_categories
     _worker_bars = Bars.from_csv(bars_path)
     _worker_strategy_class = _resolve_strategy(strategy_name)
+    
+    # Load category dates from serialized JSON (passed from parent process)
+    _worker_all_category_dates = json.loads(all_cat_dates_json) if all_cat_dates_json else {}
+    
+    # Set always-on categories
+    _worker_always_on_categories = always_on_cats or []
+    _worker_blocked_dates = set()
+    for cat in _worker_always_on_categories:
+        if cat in _worker_all_category_dates:
+            _worker_blocked_dates.update(_worker_all_category_dates[cat])
 
 
-def _worker_run(args: Tuple[Dict[str, Any], float, float, int, bool, bool]) -> Optional[dict]:
+# Global blocked dates set (loaded once, shared across worker runs)
+_worker_blocked_dates = set()
+_worker_all_category_dates = {}
+_worker_always_on_categories = []
+
+def _worker_set_blocked_dates(dates: set):
+    """Set always-on blocked dates for worker processes."""
+    global _worker_blocked_dates
+    _worker_blocked_dates = dates
+
+def _worker_set_all_category_dates(all_dates: dict):
+    """Set all category dates for per-combo __block_ param handling."""
+    global _worker_all_category_dates
+    _worker_all_category_dates = all_dates
+
+
+def _worker_run(args: Tuple[Dict[str, Any], float, float, int, bool, bool, float]) -> Optional[dict]:
     """Run a single backtest. Returns result dict or None if filtered."""
-    params, fee_pct, initial_capital, warmup_bars, fill_on_bar_close, calc_on_order_fills = args
+    params, fee_pct, initial_capital, warmup_bars, fill_on_bar_close, calc_on_order_fills, contract_value = args
+
+    # Build per-combo blocked dates: start with always-on, add __block_ categories
+    combo_blocked = set(_worker_blocked_dates)
+    clean_params = {}
+    block_labels = []
+    has_block_params = False
+    for k, v in params.items():
+        if k.startswith("__block_"):
+            has_block_params = True
+            cat = k[8:]  # strip "__block_" prefix
+            if v and cat in _worker_all_category_dates:
+                combo_blocked.update(_worker_all_category_dates[cat])
+                block_labels.append(cat)
+            elif v:
+                # Category requested but not found in dates data!
+                print(f"  WARNING: __block_{cat}=True but '{cat}' not in _worker_all_category_dates (keys: {list(_worker_all_category_dates.keys())[:5]})", file=sys.stderr)
+        else:
+            clean_params[k] = v
+    
+    # Debug: log first combo only
+    if has_block_params and params.get("__block_fomc") is True:
+        print(f"  DEBUG _worker_run: block_labels={block_labels}, combo_blocked_count={len(combo_blocked)}, all_cat_keys={list(_worker_all_category_dates.keys())}", file=sys.stderr)
 
     strategy = _worker_strategy_class()
     stats = BacktestEngine.run_fast(
-        strategy, _worker_bars, params,
+        strategy, _worker_bars, clean_params,
         initial_capital=initial_capital,
         fee_pct=fee_pct,
         warmup_bars=warmup_bars,
         fill_on_bar_close=fill_on_bar_close,
         calc_on_order_fills=calc_on_order_fills,
+        blocked_dates=combo_blocked if combo_blocked else None,
+        contract_value=contract_value,
     )
 
     if stats.total_trades == 0:
@@ -161,8 +211,6 @@ def _worker_run(args: Tuple[Dict[str, Any], float, float, int, bool, bool]) -> O
         "dd_pct": round(stats.max_drawdown_pct, 2),
         "wr": round(stats.win_rate, 1),
         "trades": stats.total_trades,
-        "gross_profit": round(stats.gross_profit, 2),
-        "gross_loss": round(stats.gross_loss, 2),
     }
 
 
@@ -266,11 +314,47 @@ def run_sweep(
     sort_by = settings.get("sort_by", "pf")
     min_trades = settings.get("min_trades", 0)
     max_dd_pct = settings.get("max_dd_pct", 100.0)
-    warmup_bars = settings.get("warmup_bars", 0)
+    warmup_bars = settings.get("warmup_bars", 500)  # default 500 bars for indicator convergence
 
     # TradingView fill/recalculation modes
     fill_on_bar_close = settings.get("fill_on_bar_close", False)
     calc_on_order_fills = settings.get("calc_on_order_fills", True)
+
+    # Futures point multiplier (MES=5, MNQ=2, ES=50, NQ=20, etc.)
+    contract_value = settings.get("contract_value", 1.0)
+
+    # Load blocked dates from config categories
+    blocked_dates = set()
+    blocked_categories = settings.get("blocked_date_categories", [])
+    
+    # Load blocked dates JSON file (needed for both always-on and sweep categories)
+    _all_category_dates = {}
+    _here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in [
+        os.path.join(_here, "blocked_dates.json"),
+        os.path.join(os.environ.get("APPDATA", ""), "StrategyOptimizer", "blocked_dates.json"),
+    ]:
+        if os.path.exists(candidate):
+            try:
+                with open(candidate) as f:
+                    _all_category_dates = json.load(f)
+            except Exception as e:
+                print(f"  Warning: Failed to load blocked_dates.json: {e}", file=sys.stderr)
+            break
+
+    # Build always-on blocked dates
+    for cat in blocked_categories:
+        if cat in _all_category_dates:
+            blocked_dates.update(_all_category_dates[cat])
+    if blocked_dates:
+        print(f"  Blocked dates (always-on): {len(blocked_dates)} from {blocked_categories}", file=sys.stderr)
+
+    # Store all category dates globally for _worker_run to build per-combo sets
+    _worker_set_blocked_dates(blocked_dates)
+    _worker_set_all_category_dates(_all_category_dates)
+
+    # Serialize for passing to multiprocessing subprocesses
+    _all_cat_dates_json = json.dumps(_all_category_dates) if _all_category_dates else "{}"
 
     # Build parameter grid
     param_names, grid = build_param_grid(config.get("parameters", {}), strategy_class)
@@ -294,14 +378,14 @@ def run_sweep(
 
     # Prepare worker args
     work_items = [(params, fee_pct, initial_capital, warmup_bars,
-                   fill_on_bar_close, calc_on_order_fills) for params in grid]
+                   fill_on_bar_close, calc_on_order_fills, contract_value) for params in grid]
 
     t0 = time.time()
     results = []
 
     if total <= 4 or num_workers <= 1:
         # Small grid — run in-process (no multiprocessing overhead)
-        _worker_init(data_path, strategy_name)
+        _worker_init(data_path, strategy_name, blocked_categories, _all_cat_dates_json)
         for idx, item in enumerate(work_items):
             r = _worker_run(item)
             if r is not None:
@@ -313,7 +397,7 @@ def run_sweep(
         with mp.Pool(
             processes=num_workers,
             initializer=_worker_init,
-            initargs=(data_path, strategy_name),
+            initargs=(data_path, strategy_name, blocked_categories, _all_cat_dates_json),
         ) as pool:
             completed = 0
             for r in pool.imap_unordered(_worker_run, work_items, chunksize=max(1, total // (num_workers * 10))):

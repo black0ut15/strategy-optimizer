@@ -338,13 +338,20 @@ class CryptoFetcher:
         if cached_start is not None:
             print(f"  Cache found: {cached_start.date()} -> {cached_end.date()}")
 
+            # Always re-fetch the last 6 hours to ensure data is current
+            freshness_cutoff = end - timedelta(hours=6)
+
             fully_covered = (
                 cached_start <= start and
                 cached_end >= end - timedelta(minutes=5)
             )
             if fully_covered:
-                print("  Fully cached -- loading from DB...")
-                return self.cache.load_bars(symbol, source, interval_key, start, end)
+                # Even if "fully covered", re-fetch recent bars for freshness
+                if cached_end < freshness_cutoff:
+                    print(f"  Cache stale — re-fetching from {cached_end.date()}")
+                else:
+                    print("  Fully cached -- loading from DB...")
+                    return self.cache.load_bars(symbol, source, interval_key, start, end)
 
             # Fetch older gap
             if cached_start > start:
@@ -354,11 +361,11 @@ class CryptoFetcher:
                     self.cache.save_bars(symbol, source, interval_key, old_df)
                     print(f"  Saved {len(old_df):,} older bars.")
 
-            # Fetch newer gap
-            if cached_end < end - timedelta(minutes=5):
-                fetch_from = cached_end + timedelta(minutes=1)
-                print(f"  Fetching newer gap: {fetch_from.date()} -> {end.date()}")
-                new_df = fetch_fn(fetch_from, end)
+            # Fetch newer gap (always fetch from at least freshness_cutoff)
+            refetch_from = min(cached_end + timedelta(minutes=1), freshness_cutoff)
+            if refetch_from < end:
+                print(f"  Fetching newer data: {refetch_from.date()} -> {end.date()}")
+                new_df = fetch_fn(refetch_from, end)
                 if not new_df.empty:
                     self.cache.save_bars(symbol, source, interval_key, new_df)
                     print(f"  Saved {len(new_df):,} newer bars.")
@@ -378,16 +385,18 @@ class CryptoFetcher:
 
     def get_bars(self, symbol: str, interval: str = "5m",
                  days_back: int = 365, use_cache: bool = True,
-                 end: datetime = None, warmup_days: int = 0) -> pd.DataFrame:
+                 end: datetime = None, start: datetime = None,
+                 warmup_days: int = 0) -> pd.DataFrame:
         """
         Fetch OHLCV bars from Binance. No API key required.
 
         Args:
             symbol:    Binance symbol (e.g. "BTCUSDT", "ETHUSDT", "SOLUSDT")
             interval:  Bar size: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 1d, 1w
-            days_back: Calendar days of history
+            days_back: Calendar days of history (used if start is not specified)
             use_cache: Use SQLite cache
             end:       End datetime (default: now)
+            start:     Start datetime (overrides days_back if specified)
             warmup_days: Extra days to prepend for indicator warmup (default: 0)
 
         Returns:
@@ -395,8 +404,12 @@ class CryptoFetcher:
         """
         symbol = symbol.upper()
         end    = self._ensure_utc(end or datetime.now(timezone.utc))
-        total_days = days_back + warmup_days
-        start  = end - timedelta(days=total_days)
+        if start is not None:
+            start = self._ensure_utc(start) - timedelta(days=warmup_days)
+            total_days = (end - start).days
+        else:
+            total_days = days_back + warmup_days
+            start = end - timedelta(days=total_days)
 
         cache_source = "binance_futures" if self.futures_mode else "binance"
         mode_label   = "Binance Futures (fapi)" if self.futures_mode else "Binance"
@@ -618,8 +631,14 @@ if __name__ == "__main__":
     fetcher = CryptoFetcher(futures_mode=futures_mode)
 
     if command == "export":
+        # Write with the exact filename Rust expects: SYMBOL_INTERVAL_DAYSd_bt.csv
+        # Use the CLI 'days' arg (which includes warmup) as the filename days
+        data_dir = os.path.join("data", "crypto")
+        os.makedirs(data_dir, exist_ok=True)
+        filepath = os.path.join(data_dir, f"{symbol}_{interval}_{days}d_bt.csv")
         fetcher.export_backtester_csv(symbol, interval=interval, days_back=days,
-                                      source="binance" if futures_mode else source)
+                                      source="binance" if futures_mode else source,
+                                      filepath=filepath)
 
     elif command == "csv":
         fetcher.export_csv(symbol, interval=interval, days_back=days,

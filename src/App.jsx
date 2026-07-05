@@ -20,11 +20,26 @@ function loadState(key, fallback) {
   } catch { return fallback; }
 }
 
+// ── Discord webhook notification ──
+async function sendDiscordNotification(webhookUrl, message) {
+  if (!webhookUrl) return;
+  try {
+    await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: message }),
+    });
+  } catch (e) {
+    console.error("Discord webhook failed:", e);
+  }
+}
+
 export default function App() {
   const [tab, setTab] = useState(0);
   const [dataInfo, setDataInfo] = useState(null);
-  const [sweepResults, setSweepResults] = useState(() => loadState("sweepResults", null));
+  const [sweepResults, setSweepResults] = useState(null);
   const [lastSweepStrategy, setLastSweepStrategy] = useState(() => loadState("lastSweepStrategy", ""));
+  const [sweptParams, setSweptParams] = useState([]);
   const [lastSweepSettings, setLastSweepSettings] = useState(() => loadState("lastSweepSettings", {}));
   const [progress, setProgress] = useState(0);
   const [running, setRunning] = useState(false);
@@ -68,7 +83,8 @@ export default function App() {
   // Auto-save state on change
   useEffect(() => { saveState("workers", workers.map(w => ({ address: w.address, name: w.name }))); }, [workers]);
   useEffect(() => { saveState("pineCode", pineCode); }, [pineCode]);
-  useEffect(() => { if (sweepResults) saveState("sweepResults", sweepResults); }, [sweepResults]);
+  // Results are NOT persisted to localStorage — they can be huge and crash the app on reload.
+  // Use CSV export to save results.
   useEffect(() => { if (lastSweepStrategy) saveState("lastSweepStrategy", lastSweepStrategy); }, [lastSweepStrategy]);
   useEffect(() => { saveState("lastSweepSettings", lastSweepSettings); }, [lastSweepSettings]);
   useEffect(() => { if (dataInfo?.file_path) { setLastDataPath(dataInfo.file_path); saveState("lastDataPath", dataInfo.file_path); } }, [dataInfo]);
@@ -80,6 +96,24 @@ export default function App() {
     const h = Math.floor(secs / 3600);
     const m = Math.floor((secs % 3600) / 60);
     return `${h}h ${m}m`;
+  }
+
+  // Format Unix ms timestamp or date string to readable date
+  function formatDate(d) {
+    if (!d) return "";
+    // If it's already a readable date string, return as-is
+    if (typeof d === "string" && d.includes("-") && d.length > 8) return d;
+    // Unix ms timestamp (number or numeric string)
+    const ts = typeof d === "number" ? d : parseInt(d);
+    if (!isNaN(ts) && ts > 1e12) {
+      const date = new Date(ts);
+      return date.toISOString().slice(0, 10); // YYYY-MM-DD
+    }
+    if (!isNaN(ts) && ts > 1e9) {
+      const date = new Date(ts * 1000); // Unix seconds
+      return date.toISOString().slice(0, 10);
+    }
+    return String(d);
   }
 
   function SweepProgress({ progress }) {
@@ -118,7 +152,7 @@ export default function App() {
       setStatus("Loading data...");
       const info = await invoke("load_data", { path });
       setDataInfo(info);
-      setStatus(`Loaded ${info.bars.toLocaleString()} bars: ${info.symbol} (${info.first_date} → ${info.last_date})`);
+      setStatus(`Loaded ${info.bars.toLocaleString()} bars: ${info.symbol} (${formatDate(info.first_date)} → ${formatDate(info.last_date)})`);
     } catch (e) {
       setStatus(`Error: ${e}`);
     }
@@ -130,20 +164,26 @@ export default function App() {
       // Stop local sweep
       await invoke("stop_sweep").catch(() => {});
 
-      // Stop all workers
+      // Reset all workers (send /reset directly via fetch for reliability)
       for (const w of workers) {
-        if (w.status === "running") {
+        try {
+          // Try direct fetch first (bypasses Rust IPC)
+          await fetch(`http://${w.address}/reset`, { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" })
+            .catch(() => {});
+          // Also try Rust IPC as fallback
           await invoke("stop_worker", { address: w.address }).catch(() => {});
           setWorkers(prev => prev.map(x =>
             x.address === w.address ? { ...x, status: "stopped" } : x
           ));
+        } catch (e) {
+          console.error(`Failed to stop ${w.name}: ${e}`);
         }
       }
 
       setRunning(false);
       setProgress(0);
       setSweepStart(null);
-      setStatus("Sweep stopped.");
+      setStatus("Sweep stopped — all workers reset.");
     } catch (e) {
       setStatus(`Stop error: ${e}`);
     }
@@ -155,6 +195,9 @@ export default function App() {
       setStatus("Load data first!");
       return;
     }
+    // Clear previous results
+    setSweepResults(null);
+    try { localStorage.removeItem("so_sweepResults"); } catch {}
     try {
       setRunning(true);
       setProgress(0);
@@ -218,7 +261,7 @@ export default function App() {
         for (const vals of Object.values(config.parameters || {})) {
           if (Array.isArray(vals)) {
             if (vals.length === 3 && typeof vals[0] === "number" && typeof vals[2] === "number" && vals[2] > 0) {
-              totalCombos *= Math.max(1, Math.floor((vals[1] - vals[0]) / vals[2]) + 1);
+              totalCombos *= Math.max(1, Math.round((vals[1] - vals[0]) / vals[2]) + 1);
             } else {
               totalCombos *= Math.max(1, vals.length);
             }
@@ -362,20 +405,23 @@ export default function App() {
         setTab(2);
 
         // Save benchmarked speeds using individual elapsed times
+        // Only update speeds from meaningful chunks to avoid inflated values
         const elapsedSec = (Date.now() - sweepStartMs) / 1000;
         const newSpeeds = { ...loadState("workerSpeeds", {}) };
-        if (localCombos >= 5) {
-          newSpeeds["local"] = localCombos / Math.max(1, elapsedSec);
+        // Local speed: only update if we had a meaningful chunk
+        if (localCombos >= 20 && elapsedSec >= 5) {
+          newSpeeds["local"] = localCombos / elapsedSec;
         }
         for (let i = 0; i < workingWorkers.length; i++) {
           const w = workingWorkers[i];
           const chunk = chunks[i + 1];
           const workerCombos = chunk.end - chunk.start;
-          if (workerCombos < 5) continue;
+          // Only record speed for meaningful chunks (>=20 combos, >=3s elapsed)
+          if (workerCombos < 20) continue;
           try {
             const info = await invoke("poll_worker", { address: w.address });
             const workerElapsed = info.elapsed || elapsedSec;
-            if (workerElapsed >= 1) {
+            if (workerElapsed >= 3) {
               newSpeeds[w.address] = workerCombos / workerElapsed;
             }
           } catch {
@@ -386,6 +432,15 @@ export default function App() {
         console.log("Worker speeds:", newSpeeds);
 
         setStatus(`Distributed sweep complete! ${allResults.length} results from ${nodeCount} nodes in ${formatTime(elapsedSec)}.`);
+
+        // Discord notification
+        const sweepSettings = loadState("sweepSettings", {});
+        if (sweepSettings.discord_notify && sweepSettings.discord_webhook_url) {
+          const best = allResults[0]?.result;
+          sendDiscordNotification(sweepSettings.discord_webhook_url,
+            `🏁 **Sweep Complete**\n${allResults.length} results from ${nodeCount} nodes in ${formatTime(elapsedSec)}` +
+            (best ? `\nBest: PF ${best.profit_factor?.toFixed(3)} | Net $${best.net_pnl?.toFixed(0)} | ${best.trades} trades` : ""));
+        }
       }
     } catch (e) {
       setStatus(`Sweep error: ${e}`);
@@ -409,6 +464,15 @@ export default function App() {
 
       const parsedConfig = JSON.parse(configJson);
       const activeWorkers = workers.filter(w => w.status !== "error" && w.status !== "offline");
+
+      // Track which params are being swept (have ranges or multiple values)
+      const swept = [];
+      for (const [k, v] of Object.entries(parsedConfig.parameters || {})) {
+        if (Array.isArray(v) && (v.length > 1 || (v.length === 3 && typeof v[0] === "number" && typeof v[2] === "number" && v[2] > 0 && v[1] > v[0]))) {
+          swept.push(k);
+        }
+      }
+      setSweptParams(swept);
 
       if (activeWorkers.length === 0) {
         // ── Local-only Python sweep ──
@@ -469,12 +533,12 @@ export default function App() {
           }
         }
 
-        // Estimate total combos matching Python's np.arange (floor, exclusive stop)
+        // Estimate total combos matching Python's expand_param (with epsilon for float safety)
         let totalCombos = 1;
         for (const vals of Object.values(parsedConfig.parameters || {})) {
           if (Array.isArray(vals)) {
             if (vals.length === 3 && typeof vals[0] === "number" && typeof vals[2] === "number" && vals[2] > 0) {
-              totalCombos *= Math.max(1, Math.floor((vals[1] - vals[0]) / vals[2]) + 1);
+              totalCombos *= Math.max(1, Math.round((vals[1] - vals[0]) / vals[2]) + 1);
             } else {
               totalCombos *= Math.max(1, vals.length);
             }
@@ -567,21 +631,35 @@ export default function App() {
           localProgress = event.payload;
         });
 
-        // Poll combined progress
+        // Poll combined progress (weighted by chunk size, ETA based on slowest worker)
         const progressInterval = setInterval(async () => {
-          let totalProgress = localProgress;
-          let cnt = 1;
+          let totalWeightedProgress = localProgress; // local contributes as fraction of total
+          let totalChunks = 1; // local counts as 1 unit
+          let workerDetails = [];
           for (const w of actualWorkingWorkers) {
             try {
               const info = await invoke("poll_worker", { address: w.address });
               setWorkers(prev => prev.map(x =>
                 x.address === w.address ? info : x
               ));
-              totalProgress += info.progress;
-              cnt++;
+              workerDetails.push({ name: w.name, progress: info.progress, combos: info.total_combos || 0 });
             } catch (e) { /* skip */ }
           }
-          setProgress(totalProgress / cnt);
+          // Weighted progress: each worker's contribution is proportional to its chunk size
+          const totalCombos = workerDetails.reduce((s, w) => s + w.combos, 0) + 1; // +1 for local
+          if (totalCombos > 1) {
+            let weighted = localProgress * (1 / totalCombos); // local estimate
+            for (const w of workerDetails) {
+              weighted += w.progress * (w.combos / totalCombos);
+            }
+            setProgress(weighted);
+          } else {
+            // Fallback: simple average
+            let total = localProgress;
+            let cnt = 1;
+            for (const w of workerDetails) { total += w.progress; cnt++; }
+            setProgress(total / cnt);
+          }
         }, 2000);
 
         const localResultJson = await invoke("run_python_sweep", { strategy: strategyName, configJson: localConfigJson });
@@ -634,21 +712,22 @@ export default function App() {
         setTab(2);
 
         // Save benchmarked speeds using individual elapsed times
+        // Only update speeds from meaningful chunks to avoid inflated values
         const localElapsed = (Date.now() - sweepStartMs) / 1000;
         const newSpeeds = { ...loadState("workerSpeeds", {}) };
-        if (localCombos >= 5) {
+        if (localCombos >= 20 && localElapsed >= 5) {
           newSpeeds["local"] = localCombos / Math.max(1, localElapsed);
         }
         for (let i = 0; i < workingWorkers.length; i++) {
           const w = workingWorkers[i];
           const chunk = chunks[i + 1];
           const workerCombos = chunk.end - chunk.start;
-          // Only record speed for meaningful chunks (>=5 combos)
-          if (workerCombos < 5) continue;
+          // Only record speed for meaningful chunks (>=20 combos, >=3s elapsed)
+          if (workerCombos < 20) continue;
           try {
             const info = await invoke("poll_worker", { address: w.address });
             const workerElapsed = info.elapsed || localElapsed;
-            if (workerElapsed >= 1) {
+            if (workerElapsed >= 3) {
               newSpeeds[w.address] = workerCombos / workerElapsed;
             }
           } catch {
@@ -659,6 +738,15 @@ export default function App() {
         console.log("Worker speeds:", newSpeeds);
 
         setStatus(`Distributed sweep done! ${allResults.length} results from ${nodeCount} nodes in ${formatTime(localElapsed)}.`);
+
+        // Discord notification
+        const sweepSettings = loadState("sweepSettings", {});
+        if (sweepSettings.discord_notify && sweepSettings.discord_webhook_url) {
+          const best = allResults[0]?.result || allResults[0];
+          sendDiscordNotification(sweepSettings.discord_webhook_url,
+            `🏁 **Sweep Complete**\n${allResults.length} results from ${nodeCount} nodes in ${formatTime(localElapsed)}` +
+            (best ? `\nBest: PF ${(best.profit_factor || best.pf)?.toFixed(3)} | Net $${(best.net_pnl || best.net)?.toFixed(0)} | ${best.trades} trades` : ""));
+        }
       }
     } catch (e) {
       setStatus(`Python sweep error: ${e}`);
@@ -669,13 +757,69 @@ export default function App() {
     }
   }, [dataInfo, workers]);
 
+  // Run detail backtest for a single param set — returns trade log
+  const handleRunDetail = useCallback(async (params) => {
+    if (!dataInfo || !lastSweepStrategy) return null;
+    try {
+      setStatus("Running detail backtest...");
+      const dataPath = loadState("lastDataPath", "");
+      const config = {
+        strategy: lastSweepStrategy,
+        data_path: dataPath,
+        params,
+        settings: lastSweepSettings,
+      };
+      const resultJson = await invoke("run_python_detail", {
+        strategy: lastSweepStrategy,
+        configJson: JSON.stringify(config),
+      });
+      const result = JSON.parse(resultJson);
+      setStatus(`Detail: ${result.trade_log?.length || 0} trades, PF ${result.stats?.pf?.toFixed(3)}`);
+      return result;
+    } catch (e) {
+      setStatus(`Detail error: ${e}`);
+      return null;
+    }
+  }, [dataInfo, lastSweepStrategy, lastSweepSettings]);
+
+  // Save trades CSV
+  const handleSaveTrades = useCallback(async (trades) => {
+    if (!trades || trades.length === 0) return;
+    try {
+      const randId = Math.random().toString(36).substring(2, 7);
+      const stratName = lastSweepStrategy || "strategy";
+      const defaultName = `Trades ${stratName} ${randId}.csv`;
+      const path = await save({
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+        defaultPath: defaultName,
+      });
+      if (!path) return;
+      const headers = "#,Direction,Entry Price,Exit Price,Qty,Gross P&L,Fee,Net P&L,Bars Held,Exit Reason,Entry Time,Exit Time";
+      const fmtTime = (t) => {
+        if (!t) return "";
+        if (typeof t === "number") return new Date(t > 1e12 ? t : t * 1000).toISOString().replace("T", " ").slice(0, 19);
+        return String(t);
+      };
+      const rows = trades.map(t =>
+        `${t.trade_num},${t.direction},${t.entry_price},${t.exit_price},${t.qty},${t.gross_pnl},${t.fee},${t.net_pnl},${t.bars_held},${t.exit_reason || ""},${fmtTime(t.entry_time)},${fmtTime(t.exit_time)}`
+      );
+      await invoke("save_results", { path, csvData: [headers, ...rows].join("\n") });
+      setStatus(`Saved ${trades.length} trades to ${path}`);
+    } catch (e) {
+      setStatus(`Save trades error: ${e}`);
+    }
+  }, [lastSweepStrategy]);
+
   // Save results
   const handleSaveResults = useCallback(async () => {
     if (!sweepResults) return;
     try {
+      const randId = Math.random().toString(36).substring(2, 7);
+      const stratName = lastSweepStrategy || "sweep";
+      const defaultName = `${stratName} Sweep Results ${randId}.csv`;
       const path = await save({
         filters: [{ name: "CSV", extensions: ["csv"] }],
-        defaultPath: "sweep_results.csv",
+        defaultPath: defaultName,
       });
       if (!path) return;
       // Convert results to CSV — handle both flat (Python) and nested (Pine) formats
@@ -733,7 +877,7 @@ export default function App() {
               <span className="text-xs text-zinc-500">·</span>
               <span className="text-xs text-zinc-400">{dataInfo.bars.toLocaleString()} bars</span>
               <span className="text-xs text-zinc-500">·</span>
-              <span className="text-xs text-zinc-500">{dataInfo.first_date} → {dataInfo.last_date}</span>
+              <span className="text-xs text-zinc-500">{formatDate(dataInfo.first_date)} → {formatDate(dataInfo.last_date)}</span>
               <button onClick={handleLoadData} title="Change data file"
                 className="ml-1 text-zinc-600 hover:text-zinc-300 transition-colors text-xs">⟳</button>
             </div>
@@ -795,9 +939,12 @@ export default function App() {
           <Results
             results={sweepResults}
             onSave={handleSaveResults}
+            onRunDetail={handleRunDetail}
+            onSaveTrades={handleSaveTrades}
             dataInfo={dataInfo}
             sweepStrategy={lastSweepStrategy}
             sweepSettings={lastSweepSettings}
+            sweptParams={sweptParams}
           />
         )}
       </div>

@@ -26,3 +26,9 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Tool databases and deployment artifacts
+.gitnexus/
+worker_package/
+worker_package.zip
+*.diff
